@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:geometry": "node --test tests/crop-geometry.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

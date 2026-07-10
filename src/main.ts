@@ -1,6 +1,14 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  clampRectToBounds,
+  contentBoundsFromMargins,
+  createRectForRatio,
+  maxFit,
+  positionRectInBounds,
+  type CropRect,
+} from "./crop-geometry";
 
 type MediaMode = "image" | "video";
 type HandleMode = "move" | "nw" | "ne" | "sw" | "se";
@@ -39,13 +47,6 @@ type ExportProgressEvent = {
   currentSeconds?: number;
   totalSeconds?: number;
   message?: string;
-};
-
-type CropRect = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
 };
 
 type BlackBorderDetectionStatus =
@@ -555,6 +556,9 @@ function blackBorderStatusLabel(status: BlackBorderDetectionStatus, compact = fa
 
 function itemBlackBorderStatusLabel(item: QueueItem, compact = false) {
   if (item.blackBorderDetection.manuallyAdjusted) {
+    if (item.blackBorderDetection.status === "detected") {
+      return compact ? "去边后调整" : "已在去黑边区域内调整";
+    }
     return compact ? "已调整" : "裁切框已手动调整";
   }
   return blackBorderStatusLabel(item.blackBorderDetection.status, compact);
@@ -576,15 +580,13 @@ function markCropManuallyAdjusted(item: QueueItem | null) {
 
 function invalidateDetectionForSegmentChange(item: QueueItem) {
   const detection = item.blackBorderDetection;
-  if (
-    detection.manuallyAdjusted ||
-    !["detected", "no_border"].includes(detection.status)
-  ) {
+  if (!["detected", "no_border"].includes(detection.status)) {
     return;
   }
 
   detection.status = "needs_review";
   detection.confidence = null;
+  detection.manuallyAdjusted = false;
   detection.warning = "输出片段已改变，请重新检测黑边后再批量导出。";
   syncBlackBorderDetectionUi();
   renderThumbs();
@@ -612,7 +614,11 @@ function syncBlackBorderDetectionUi() {
     return;
   }
 
-  if (detection.manuallyAdjusted) {
+  if (detection.manuallyAdjusted && detection.status === "detected") {
+    blackBorderDetailEl.textContent = item?.settings.ratio === "free"
+      ? "已保留黑边检测边界，当前在有效画面内手动调整。"
+      : `已保留黑边检测边界，并在有效画面内应用 ${item?.settings.ratio} 画幅。`;
+  } else if (detection.manuallyAdjusted) {
     blackBorderDetailEl.textContent = "当前使用手动调整后的裁切区域。";
   } else if (detection.warning) {
     blackBorderDetailEl.textContent = detection.warning;
@@ -999,26 +1005,43 @@ function ratioValue(mode = state.mode, ratio = currentItem(mode)?.settings.ratio
   return width > 0 && height > 0 ? width / height : null;
 }
 
-function maxFit(width: number, height: number, ratio: number) {
-  const currentRatio = width / height;
-  if (currentRatio > ratio) {
-    return { width: height * ratio, height };
+function getItemCropBounds(item: QueueItem, mode: MediaMode): CropRect {
+  const { width: sourceWidth, height: sourceHeight } = getItemSourceSize(item);
+  const fullSource = {
+    x: 0,
+    y: 0,
+    width: Math.max(0, sourceWidth),
+    height: Math.max(0, sourceHeight),
+  };
+
+  if (
+    mode !== "video" ||
+    item.blackBorderDetection.status !== "detected"
+  ) {
+    return fullSource;
   }
-  return { width, height: width / ratio };
+
+  return contentBoundsFromMargins(
+    sourceWidth,
+    sourceHeight,
+    item.blackBorderDetection.margins,
+  ) ?? fullSource;
+}
+
+function getCropBounds(mode = state.mode): CropRect {
+  const item = currentItem(mode);
+  return item
+    ? getItemCropBounds(item, mode)
+    : { x: 0, y: 0, width: 0, height: 0 };
 }
 
 function clampRect(mode = state.mode) {
-  const item = currentItem(mode);
-  const rect = item?.settings.rect;
-  const sourceWidth = getSourceWidth(mode);
-  const sourceHeight = getSourceHeight(mode);
-  if (!rect || sourceWidth <= 0 || sourceHeight <= 0) {
+  const rect = currentItem(mode)?.settings.rect;
+  const bounds = getCropBounds(mode);
+  if (!rect || bounds.width <= 0 || bounds.height <= 0) {
     return;
   }
-  rect.width = Math.max(2, Math.min(rect.width, sourceWidth));
-  rect.height = Math.max(2, Math.min(rect.height, sourceHeight));
-  rect.x = Math.max(0, Math.min(sourceWidth - rect.width, rect.x));
-  rect.y = Math.max(0, Math.min(sourceHeight - rect.height, rect.y));
+  Object.assign(rect, clampRectToBounds(rect, bounds));
 }
 
 function positionRectByAnchor(mode = state.mode) {
@@ -1027,27 +1050,9 @@ function positionRectByAnchor(mode = state.mode) {
   if (!rect) {
     return;
   }
-  const sourceWidth = getSourceWidth(mode);
-  const sourceHeight = getSourceHeight(mode);
+  const bounds = getCropBounds(mode);
   const anchor = item?.settings.anchor ?? "center";
-
-  if (["lt", "left", "lb"].includes(anchor)) {
-    rect.x = 0;
-  } else if (["rt", "right", "rb"].includes(anchor)) {
-    rect.x = sourceWidth - rect.width;
-  } else {
-    rect.x = (sourceWidth - rect.width) / 2;
-  }
-
-  if (["lt", "top", "rt"].includes(anchor)) {
-    rect.y = 0;
-  } else if (["lb", "bottom", "rb"].includes(anchor)) {
-    rect.y = sourceHeight - rect.height;
-  } else {
-    rect.y = (sourceHeight - rect.height) / 2;
-  }
-
-  clampRect(mode);
+  Object.assign(rect, positionRectInBounds(rect, bounds, anchor));
 }
 
 function ensureRect(mode = state.mode) {
@@ -1055,28 +1060,16 @@ function ensureRect(mode = state.mode) {
   if (!item?.lastProbe) {
     return;
   }
-  const sourceWidth = getSourceWidth(mode);
-  const sourceHeight = getSourceHeight(mode);
+  const bounds = getCropBounds(mode);
   const ratio = ratioValue(mode);
 
   if (!item.settings.rect) {
-    if (ratio === null) {
-      item.settings.rect = {
-        x: 0,
-        y: 0,
-        width: sourceWidth,
-        height: sourceHeight,
-      };
-    } else {
-      const fitted = maxFit(sourceWidth, sourceHeight, ratio);
-      item.settings.rect = {
-        x: 0,
-        y: 0,
-        width: fitted.width * item.settings.scale,
-        height: fitted.height * item.settings.scale,
-      };
-      positionRectByAnchor(mode);
-    }
+    item.settings.rect = createRectForRatio(
+      bounds,
+      ratio,
+      item.settings.scale,
+      item.settings.anchor,
+    );
   }
 
   clampRect(mode);
@@ -1092,14 +1085,15 @@ function resizeRectByScale(mode = state.mode) {
   if (!rect || ratio === null) {
     return;
   }
-  const fitted = maxFit(getSourceWidth(mode), getSourceHeight(mode), ratio);
+  const bounds = getCropBounds(mode);
+  const fitted = maxFit(bounds.width, bounds.height, ratio);
   const centerX = rect.x + rect.width / 2;
   const centerY = rect.y + rect.height / 2;
   rect.width = fitted.width * item.settings.scale;
   rect.height = fitted.height * item.settings.scale;
   rect.x = centerX - rect.width / 2;
   rect.y = centerY - rect.height / 2;
-  clampRect(mode);
+  Object.assign(rect, clampRectToBounds(rect, bounds));
 }
 
 function clampVideoSettings(mode = state.mode) {
@@ -1292,7 +1286,8 @@ function syncScaleFromRect() {
   if (ratio === null) {
     return;
   }
-  const fitted = maxFit(getSourceWidth(), getSourceHeight(), ratio);
+  const bounds = getCropBounds();
+  const fitted = maxFit(bounds.width, bounds.height, ratio);
   item.settings.scale = Math.max(0.1, Math.min(1, item.settings.rect.width / fitted.width));
   if (scaleInput) {
     scaleInput.value = String(Math.round(item.settings.scale * 100));
@@ -1797,12 +1792,19 @@ function bindCropDragging() {
     const dx = (event.clientX - startX) / scale;
     const dy = (event.clientY - startY) / scale;
     const ratio = ratioValue();
-    const sourceWidth = getSourceWidth();
-    const sourceHeight = getSourceHeight();
+    const bounds = getCropBounds();
+    const boundsRight = bounds.x + bounds.width;
+    const boundsBottom = bounds.y + bounds.height;
 
     if (mode === "move") {
-      item.settings.rect.x = Math.max(0, Math.min(sourceWidth - startRect.width, startRect.x + dx));
-      item.settings.rect.y = Math.max(0, Math.min(sourceHeight - startRect.height, startRect.y + dy));
+      item.settings.rect.x = Math.max(
+        bounds.x,
+        Math.min(boundsRight - startRect.width, startRect.x + dx),
+      );
+      item.settings.rect.y = Math.max(
+        bounds.y,
+        Math.min(boundsBottom - startRect.height, startRect.y + dy),
+      );
     } else if (ratio === null) {
       let x1 = startRect.x;
       let y1 = startRect.y;
@@ -1823,10 +1825,10 @@ function bindCropDragging() {
         y2 += dy;
       }
 
-      x1 = Math.max(0, Math.min(x1, x2 - 20));
-      y1 = Math.max(0, Math.min(y1, y2 - 20));
-      x2 = Math.min(sourceWidth, Math.max(x2, x1 + 20));
-      y2 = Math.min(sourceHeight, Math.max(y2, y1 + 20));
+      x1 = Math.max(bounds.x, Math.min(x1, x2 - 20));
+      y1 = Math.max(bounds.y, Math.min(y1, y2 - 20));
+      x2 = Math.min(boundsRight, Math.max(x2, x1 + 20));
+      y2 = Math.min(boundsBottom, Math.max(y2, y1 + 20));
       item.settings.rect = {
         x: x1,
         y: y1,
@@ -1861,20 +1863,21 @@ function bindCropDragging() {
         nextY = startRect.y + startRect.height - nextHeight;
       }
 
-      if (nextX < 0) {
-        const overflow = -nextX;
+      if (nextX < bounds.x) {
+        const overflow = bounds.x - nextX;
         nextWidth -= overflow;
         nextHeight = nextWidth / ratio;
-        nextX = 0;
+        nextX = bounds.x;
       }
-      if (nextY < 0) {
-        nextY = 0;
+      if (nextY < bounds.y) {
+        nextY = bounds.y;
       }
-      if (nextX + nextWidth > sourceWidth) {
-        nextWidth = sourceWidth - nextX;
+      if (nextX + nextWidth > boundsRight) {
+        nextWidth = boundsRight - nextX;
+        nextHeight = nextWidth / ratio;
       }
-      if (nextY + nextHeight > sourceHeight) {
-        nextHeight = sourceHeight - nextY;
+      if (nextY + nextHeight > boundsBottom) {
+        nextHeight = boundsBottom - nextY;
         nextWidth = nextHeight * ratio;
       }
 
@@ -2043,8 +2046,8 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item) {
       return;
     }
-    markCropManuallyAdjusted(item);
     item.settings.ratio = getSelectedRatio();
+    markCropManuallyAdjusted(item);
     item.settings.rect = null;
     ensureRect();
     drawCropBox();
@@ -2283,15 +2286,18 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!sourceRect) {
       return;
     }
+    const sourceBounds = getItemCropBounds(source, state.mode);
     const relativeRect = {
-      x: sourceRect.x / getSourceWidth(),
-      y: sourceRect.y / getSourceHeight(),
-      width: sourceRect.width / getSourceWidth(),
-      height: sourceRect.height / getSourceHeight(),
+      x: (sourceRect.x - sourceBounds.x) / sourceBounds.width,
+      y: (sourceRect.y - sourceBounds.y) / sourceBounds.height,
+      width: sourceRect.width / sourceBounds.width,
+      height: sourceRect.height / sourceBounds.height,
     };
     const sourceRatio = source.settings.ratio;
     const fixedRatio = ratioValue(state.mode, sourceRatio);
-    const sourceFit = fixedRatio ? maxFit(getSourceWidth(), getSourceHeight(), fixedRatio) : null;
+    const sourceFit = fixedRatio
+      ? maxFit(sourceBounds.width, sourceBounds.height, fixedRatio)
+      : null;
     const actualScale = sourceFit ? Math.max(0.1, Math.min(1, sourceRect.width / sourceFit.width)) : source.settings.scale;
 
     context.items.forEach((item) => {
@@ -2304,41 +2310,43 @@ window.addEventListener("DOMContentLoaded", () => {
       item.settings.videoStartSeconds = source.settings.videoStartSeconds;
       item.settings.videoDurationSeconds = source.settings.videoDurationSeconds;
 
-      const { width, height } = getItemSourceSize(item);
-      if (!width || !height) {
+      const targetBounds = getItemCropBounds(item, state.mode);
+      if (!targetBounds.width || !targetBounds.height) {
         item.settings.rect = null;
         return;
       }
 
       if (sourceRatio === "free") {
         item.settings.rect = {
-          x: relativeRect.x * width,
-          y: relativeRect.y * height,
-          width: relativeRect.width * width,
-          height: relativeRect.height * height,
+          x: targetBounds.x + relativeRect.x * targetBounds.width,
+          y: targetBounds.y + relativeRect.y * targetBounds.height,
+          width: relativeRect.width * targetBounds.width,
+          height: relativeRect.height * targetBounds.height,
         };
       } else if (fixedRatio) {
-        const fit = maxFit(width, height, fixedRatio);
+        const fit = maxFit(targetBounds.width, targetBounds.height, fixedRatio);
         const rectWidth = fit.width * actualScale;
         const rectHeight = fit.height * actualScale;
-        const travelX = Math.max(0, width - rectWidth);
-        const travelY = Math.max(0, height - rectHeight);
-        const sourceTravelX = Math.max(0, getSourceWidth() - sourceRect.width);
-        const sourceTravelY = Math.max(0, getSourceHeight() - sourceRect.height);
-        const positionX = sourceTravelX ? sourceRect.x / sourceTravelX : 0.5;
-        const positionY = sourceTravelY ? sourceRect.y / sourceTravelY : 0.5;
+        const travelX = Math.max(0, targetBounds.width - rectWidth);
+        const travelY = Math.max(0, targetBounds.height - rectHeight);
+        const sourceTravelX = Math.max(0, sourceBounds.width - sourceRect.width);
+        const sourceTravelY = Math.max(0, sourceBounds.height - sourceRect.height);
+        const positionX = sourceTravelX
+          ? (sourceRect.x - sourceBounds.x) / sourceTravelX
+          : 0.5;
+        const positionY = sourceTravelY
+          ? (sourceRect.y - sourceBounds.y) / sourceTravelY
+          : 0.5;
         item.settings.rect = {
-          x: travelX * positionX,
-          y: travelY * positionY,
+          x: targetBounds.x + travelX * positionX,
+          y: targetBounds.y + travelY * positionY,
           width: rectWidth,
           height: rectHeight,
         };
       }
 
-      if (item === currentItem()) {
-        clampRect();
-      } else {
-        clampRect(state.mode);
+      if (item.settings.rect) {
+        item.settings.rect = clampRectToBounds(item.settings.rect, targetBounds);
       }
     });
 

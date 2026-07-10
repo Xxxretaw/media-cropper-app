@@ -97,6 +97,7 @@ type ItemSettings = {
 type ExportRequest = {
   inputPath: string;
   outputPath: string;
+  avoidOverwrite?: boolean;
   mode: MediaMode;
   ratio: string;
   anchor: string;
@@ -1630,6 +1631,7 @@ async function exportSampleCrop() {
   const request: ExportRequest = {
     inputPath: item.inputPath,
     outputPath,
+    avoidOverwrite: false,
     mode: state.mode,
     ratio: item.settings.ratio,
     anchor: item.settings.anchor,
@@ -1713,6 +1715,7 @@ async function exportBatch() {
     const request: ExportRequest = {
       inputPath: item.inputPath,
       outputPath,
+      avoidOverwrite: true,
       mode: state.mode,
       ratio: item.settings.ratio,
       anchor: item.settings.anchor,

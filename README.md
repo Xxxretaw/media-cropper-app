@@ -2,6 +2,8 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
+当前版本：`0.2.0`
+
 ## 当前能力
 
 - 图片和视频的自由裁切、固定比例裁切与批量导出。
@@ -32,6 +34,23 @@ cargo test
 
 ## 黑边检测说明
 
-检测会在所选输出片段的多个时间点采样，并综合 FFmpeg `cropdetect` 的结果。只有多数采样结果稳定一致时才会自动更新裁切框；检测到画幅变化时会保留当前裁切区域并标记“需确认”。修改视频输出时间范围后，需要重新检测。
+检测会在所选输出片段的多个时间点采样，并综合 FFmpeg `bbox` 亮度边界结果。只有多数采样结果稳定一致时才会自动更新裁切框；检测到画幅变化时会保留当前裁切区域并标记“需确认”。修改视频输出时间范围后，需要重新检测。
 
 当前仓库只包含 Apple Silicon macOS 使用的 FFmpeg/FFprobe sidecar。构建其他平台版本前，需要补充对应目标架构的二进制文件。
+
+内置 sidecar 基于 FFmpeg 8.1.1 官方源码构建，仅依赖 macOS 系统库。构建配置、源码校验值和许可证说明见 [`scripts/build-ffmpeg-macos-arm64.sh`](scripts/build-ffmpeg-macos-arm64.sh) 与 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+## macOS 发行包
+
+生成 `.app` 和 `.dmg`：
+
+```bash
+npm run tauri -- build
+```
+
+产物默认位于：
+
+- `src-tauri/target/release/bundle/macos/media-cropper.app`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.2.0_aarch64.dmg`
+
+未配置 Apple 签名身份时生成的包只适合本机或内部测试。面向普通用户发布前，必须使用 `Developer ID Application` 证书签名，并完成 Apple notarization 与 stapling；否则从网络下载后会被 Gatekeeper 警告或拦截。

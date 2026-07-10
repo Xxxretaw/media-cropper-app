@@ -2,7 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +14,8 @@ use tauri::Emitter;
 struct ExportMediaRequest {
     input_path: String,
     output_path: String,
+    #[serde(default)]
+    avoid_overwrite: bool,
     mode: String,
     ratio: String,
     anchor: String,
@@ -114,6 +116,80 @@ struct CropRect {
     height: u64,
     x: u64,
     y: u64,
+}
+
+struct OutputTarget {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl OutputTarget {
+    fn commit(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for OutputTarget {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn suffixed_output_path(path: &Path, suffix: u64) -> Result<PathBuf, String> {
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| "输出文件名无效".to_string())?;
+    let mut file_name = stem.to_os_string();
+    file_name.push(format!("_{suffix}"));
+
+    if let Some(extension) = path.extension() {
+        file_name.push(".");
+        file_name.push(extension);
+    }
+
+    Ok(path.with_file_name(file_name))
+}
+
+fn prepare_output_target(path: &Path, avoid_overwrite: bool) -> Result<OutputTarget, String> {
+    let output_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    fs::create_dir_all(output_parent).map_err(|error| format!("创建输出目录失败: {error}"))?;
+
+    if !avoid_overwrite {
+        return Ok(OutputTarget {
+            path: path.to_path_buf(),
+            remove_on_drop: false,
+        });
+    }
+
+    let mut candidate = path.to_path_buf();
+    let mut suffix = 2_u64;
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                return Ok(OutputTarget {
+                    path: candidate,
+                    remove_on_drop: true,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = suffixed_output_path(path, suffix)?;
+                suffix = suffix
+                    .checked_add(1)
+                    .ok_or_else(|| "无法为导出文件生成唯一名称".to_string())?;
+            }
+            Err(error) => return Err(format!("预留输出文件失败: {error}")),
+        }
+    }
 }
 
 fn parse_number_string(value: Option<&Value>) -> Option<String> {
@@ -518,11 +594,11 @@ fn build_preview_video_asset(input_path: String) -> Result<PreviewVideoAssetResu
             scale_filter,
             "-an",
             "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "28",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "2000k",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -661,7 +737,7 @@ fn minimum_margin(samples: &[BorderMargins], cluster: &[usize]) -> Option<Border
     Some(result)
 }
 
-fn parse_cropdetect_metadata(output: &str, source_width: u64, source_height: u64) -> Vec<CropRect> {
+fn parse_bbox_metadata(output: &str, source_width: u64, source_height: u64) -> Vec<CropRect> {
     let mut rects = Vec::new();
     let mut x = None;
     let mut y = None;
@@ -698,10 +774,10 @@ fn parse_cropdetect_metadata(output: &str, source_width: u64, source_height: u64
             continue;
         }
 
-        let Some(metadata_start) = line.find("lavfi.cropdetect.") else {
+        let Some(metadata_start) = line.find("lavfi.bbox.") else {
             continue;
         };
-        let metadata = &line[metadata_start + "lavfi.cropdetect.".len()..];
+        let metadata = &line[metadata_start + "lavfi.bbox.".len()..];
         let Some((key, raw_value)) = metadata.split_once('=') else {
             continue;
         };
@@ -714,8 +790,8 @@ fn parse_cropdetect_metadata(output: &str, source_width: u64, source_height: u64
         };
 
         match key.trim() {
-            "x" => x = Some(value),
-            "y" => y = Some(value),
+            "x1" => x = Some(value),
+            "y1" => y = Some(value),
             "w" => width = Some(value),
             "h" => height = Some(value),
             _ => {}
@@ -731,14 +807,34 @@ fn representative_rect_for_window(
     source_width: u64,
     source_height: u64,
 ) -> Option<CropRect> {
-    // With cropdetect reset=0 the final valid frame contains the accumulated
-    // maximum content extent for this sample window. Earlier-frame voting could
-    // crop content that only approaches an edge late in the window.
-    rects
+    // Use the union across the window so content that only reaches an edge in
+    // one frame is still kept. This is deliberately conservative: subtitles or
+    // overlays inside a black bar may leave part of that bar instead of cutting
+    // visible content.
+    let mut valid_rects = rects
         .iter()
-        .rev()
         .copied()
-        .find(|rect| margins_from_rect(rect, source_width, source_height).is_some())
+        .filter(|rect| margins_from_rect(rect, source_width, source_height).is_some());
+    let first = valid_rects.next()?;
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first.x.checked_add(first.width)?;
+    let mut bottom = first.y.checked_add(first.height)?;
+
+    for rect in valid_rects {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(rect.x.checked_add(rect.width)?);
+        bottom = bottom.max(rect.y.checked_add(rect.height)?);
+    }
+
+    let union = CropRect {
+        x: left,
+        y: top,
+        width: right.checked_sub(left)?,
+        height: bottom.checked_sub(top)?,
+    };
+    margins_from_rect(&union, source_width, source_height).map(|_| union)
 }
 
 fn sample_seek_positions(
@@ -756,7 +852,7 @@ fn sample_seek_positions(
         .collect()
 }
 
-fn run_cropdetect_window(
+fn run_bbox_window(
     input_path: &str,
     seek_seconds: f64,
     window_seconds: f64,
@@ -780,7 +876,7 @@ fn run_cropdetect_window(
             "-sn",
             "-dn",
             "-vf",
-            "fps=8,cropdetect=mode=black:limit=0.09:round=2:skip=0:reset=0,metadata=mode=print:file=-",
+            "fps=8,format=yuv420p,bbox=min_val=24,metadata=mode=print:file=-",
             "-f",
             "null",
             "-",
@@ -795,7 +891,7 @@ fn run_cropdetect_window(
     let mut metadata = String::from_utf8_lossy(&output.stdout).into_owned();
     metadata.push('\n');
     metadata.push_str(&String::from_utf8_lossy(&output.stderr));
-    let rects = parse_cropdetect_metadata(&metadata, source_width, source_height);
+    let rects = parse_bbox_metadata(&metadata, source_width, source_height);
     Ok(representative_rect_for_window(
         &rects,
         source_width,
@@ -883,7 +979,7 @@ fn detect_black_borders(
     let mut failed_windows = 0_usize;
 
     for seek_seconds in seek_positions.iter().copied() {
-        match run_cropdetect_window(
+        match run_bbox_window(
             &request.input_path,
             seek_seconds,
             window_seconds,
@@ -1023,11 +1119,9 @@ fn export_media_inner(
         )?,
     };
     let filter = make_crop_filter(&crop_rect);
-    let output_parent = Path::new(&request.output_path)
-        .parent()
-        .ok_or_else(|| "输出路径无效".to_string())?;
-
-    fs::create_dir_all(output_parent).map_err(|error| format!("创建输出目录失败: {error}"))?;
+    let mut output_target =
+        prepare_output_target(Path::new(&request.output_path), request.avoid_overwrite)?;
+    let output_path = output_target.path.to_string_lossy().into_owned();
 
     let mut args = vec!["-y".to_string(), "-hide_banner".to_string()];
 
@@ -1075,15 +1169,19 @@ fn export_media_inner(
             "-map".to_string(),
             "0:a:0?".to_string(),
             "-c:v".to_string(),
-            "libx264".to_string(),
-            "-preset".to_string(),
-            "veryfast".to_string(),
-            "-crf".to_string(),
-            "22".to_string(),
+            "h264_videotoolbox".to_string(),
+            "-allow_sw".to_string(),
+            "1".to_string(),
+            "-profile:v".to_string(),
+            "high".to_string(),
+            "-b:v".to_string(),
+            "6000k".to_string(),
             "-maxrate".to_string(),
-            "4000k".to_string(),
-            "-bufsize".to_string(),
             "8000k".to_string(),
+            "-bufsize".to_string(),
+            "16000k".to_string(),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
             "-c:a".to_string(),
             "aac".to_string(),
             "-movflags".to_string(),
@@ -1091,7 +1189,7 @@ fn export_media_inner(
         ]);
     }
 
-    args.push(request.output_path.clone());
+    args.push(output_path.clone());
 
     if request.mode == "video" {
         let total_seconds = request
@@ -1190,8 +1288,9 @@ fn export_media_inner(
             Some("视频导出完成".to_string()),
         );
 
+        output_target.commit();
         return Ok(ExportResult {
-            output_path: request.output_path,
+            output_path,
             applied_filter: filter,
             stderr: stderr_output,
         });
@@ -1232,8 +1331,9 @@ fn export_media_inner(
         Some("图片导出完成".to_string()),
     );
 
+    output_target.commit();
     Ok(ExportResult {
-        output_path: request.output_path,
+        output_path,
         applied_filter: filter,
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
@@ -1259,9 +1359,10 @@ pub fn run() {
 mod tests {
     use super::{
         build_preview_data_url, build_preview_video_asset, detect_black_borders,
-        detection_confidence, export_media_inner, find_ffmpeg, parse_cropdetect_metadata,
+        detection_confidence, export_media_inner, find_ffmpeg, parse_bbox_metadata,
         parse_rotation_degrees, probe_media, probe_result_from_raw, representative_rect_for_window,
-        CropRect, CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest,
+        suffixed_output_path, CropRect, CropRectRequest, DetectBlackBordersRequest,
+        ExportMediaRequest,
     };
     use serde_json::json;
     use std::env;
@@ -1294,7 +1395,9 @@ mod tests {
                 "-t",
                 "2",
                 "-c:v",
-                "libx264",
+                "mpeg4",
+                "-q:v",
+                "5",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
@@ -1341,7 +1444,9 @@ mod tests {
                 "-t",
                 "3",
                 "-c:v",
-                "libx264",
+                "mpeg4",
+                "-q:v",
+                "5",
                 "-pix_fmt",
                 "yuv420p",
                 output_path.to_str().expect("utf-8 path"),
@@ -1382,7 +1487,7 @@ mod tests {
             .expect("probe should succeed for generated sample");
 
         assert_eq!(result.media_kind, "video");
-        assert_eq!(result.codec_name.as_deref(), Some("h264"));
+        assert_eq!(result.codec_name.as_deref(), Some("mpeg4"));
         assert_eq!(result.width, Some(320));
         assert_eq!(result.height, Some(240));
         assert_eq!(result.rotation_degrees, 0);
@@ -1421,21 +1526,25 @@ mod tests {
     }
 
     #[test]
-    fn cropdetect_metadata_parser_reads_complete_frame_rectangles() {
+    fn bbox_metadata_parser_reads_complete_frame_rectangles() {
         let metadata = r#"
 frame:0 pts:0 pts_time:0
-lavfi.cropdetect.w=240
-lavfi.cropdetect.h=160
-lavfi.cropdetect.x=40
-lavfi.cropdetect.y=40
+lavfi.bbox.x1=40
+lavfi.bbox.x2=279
+lavfi.bbox.y1=40
+lavfi.bbox.y2=199
+lavfi.bbox.w=240
+lavfi.bbox.h=160
 frame:1 pts:1 pts_time:0.125
-lavfi.cropdetect.w=244
-lavfi.cropdetect.h=164
-lavfi.cropdetect.x=38
-lavfi.cropdetect.y=38
+lavfi.bbox.x1=38
+lavfi.bbox.x2=281
+lavfi.bbox.y1=38
+lavfi.bbox.y2=201
+lavfi.bbox.w=244
+lavfi.bbox.h=164
 "#;
 
-        let rects = parse_cropdetect_metadata(metadata, 320, 240);
+        let rects = parse_bbox_metadata(metadata, 320, 240);
         assert_eq!(
             rects,
             vec![
@@ -1456,7 +1565,7 @@ lavfi.cropdetect.y=38
     }
 
     #[test]
-    fn window_representative_uses_last_accumulated_cropdetect_rect() {
+    fn window_representative_uses_union_of_bbox_frames() {
         let rects = vec![
             CropRect {
                 x: 40,
@@ -1467,14 +1576,19 @@ lavfi.cropdetect.y=38
             CropRect {
                 x: 10,
                 y: 20,
-                width: 300,
-                height: 200,
+                width: 240,
+                height: 160,
             },
         ];
 
         assert_eq!(
             representative_rect_for_window(&rects, 320, 240),
-            Some(rects[1])
+            Some(CropRect {
+                x: 10,
+                y: 20,
+                width: 270,
+                height: 180,
+            })
         );
     }
 
@@ -1564,6 +1678,7 @@ lavfi.cropdetect.y=38
             ExportMediaRequest {
                 input_path: rotated_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
+                avoid_overwrite: false,
                 mode: "video".to_string(),
                 ratio: "free".to_string(),
                 anchor: "center".to_string(),
@@ -1601,6 +1716,7 @@ lavfi.cropdetect.y=38
             ExportMediaRequest {
                 input_path: input_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
+                avoid_overwrite: false,
                 mode: "video".to_string(),
                 ratio: "1:1".to_string(),
                 anchor: "center".to_string(),
@@ -1628,11 +1744,13 @@ lavfi.cropdetect.y=38
         let input_path = unique_path("export-image-input.png");
         let output_path = unique_path("export-image-output.jpg");
         create_sample_image(&input_path);
+        fs::write(&output_path, b"stale output").expect("existing output should be writable");
 
         let result = export_media_inner(
             ExportMediaRequest {
                 input_path: input_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
+                avoid_overwrite: false,
                 mode: "image".to_string(),
                 ratio: "1:1".to_string(),
                 anchor: "top".to_string(),
@@ -1647,10 +1765,73 @@ lavfi.cropdetect.y=38
         )
         .expect("image export should succeed for generated sample");
 
+        assert_eq!(result.output_path, output_path.to_string_lossy());
         assert_eq!(result.applied_filter, "crop=240:240:200:0");
         assert!(output_path.exists(), "output image should exist");
+        assert_ne!(
+            fs::read(&output_path).expect("exported image should be readable"),
+            b"stale output",
+            "single-file export should keep its existing overwrite behavior"
+        );
 
         let _ = fs::remove_file(input_path);
         let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn batch_style_exports_preserve_existing_files_and_return_unique_paths() {
+        let input_path = unique_path("unique-export-input.png");
+        let requested_path = unique_path("unique-export-output.jpg");
+        let expected_second_path =
+            suffixed_output_path(&requested_path, 2).expect("second output path should be valid");
+        let expected_third_path =
+            suffixed_output_path(&requested_path, 3).expect("third output path should be valid");
+        create_sample_image(&input_path);
+        fs::write(&requested_path, b"keep existing").expect("existing output should be writable");
+
+        let export_once = || {
+            export_media_inner(
+                ExportMediaRequest {
+                    input_path: input_path.to_string_lossy().to_string(),
+                    output_path: requested_path.to_string_lossy().to_string(),
+                    avoid_overwrite: true,
+                    mode: "image".to_string(),
+                    ratio: "1:1".to_string(),
+                    anchor: "center".to_string(),
+                    scale: 1.0,
+                    image_format: Some("jpg".to_string()),
+                    image_quality: Some(88),
+                    video_start_seconds: None,
+                    video_duration_seconds: None,
+                    crop_rect: None,
+                },
+                None,
+            )
+            .expect("non-overwriting export should succeed")
+        };
+
+        let first_result = export_once();
+        let second_result = export_once();
+
+        assert_eq!(
+            first_result.output_path,
+            expected_second_path.to_string_lossy()
+        );
+        assert_eq!(
+            second_result.output_path,
+            expected_third_path.to_string_lossy()
+        );
+        assert_eq!(
+            fs::read(&requested_path).expect("existing output should remain readable"),
+            b"keep existing",
+            "batch-style export must not overwrite an existing file"
+        );
+        assert!(expected_second_path.exists());
+        assert!(expected_third_path.exists());
+
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(requested_path);
+        let _ = fs::remove_file(expected_second_path);
+        let _ = fs::remove_file(expected_third_path);
     }
 }

@@ -11,6 +11,9 @@ type ProbeResult = {
   codec_name?: string;
   width?: number;
   height?: number;
+  rotation_degrees?: number;
+  display_width?: number;
+  display_height?: number;
   duration_seconds?: number;
   bit_rate?: number;
   raw: unknown;
@@ -43,6 +46,41 @@ type CropRect = {
   y: number;
   width: number;
   height: number;
+};
+
+type BlackBorderDetectionStatus =
+  | "not_run"
+  | "detecting"
+  | "detected"
+  | "no_border"
+  | "needs_review"
+  | "failed";
+
+type BlackBorderMargins = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+type BlackBorderDetectionResult = {
+  status: Exclude<BlackBorderDetectionStatus, "not_run" | "detecting">;
+  rect?: CropRect;
+  margins: BlackBorderMargins;
+  confidence: number;
+  sampleCount: number;
+  agreeingSamples: number;
+  warning?: string;
+};
+
+type BlackBorderDetectionState = {
+  status: BlackBorderDetectionStatus;
+  margins: BlackBorderMargins;
+  confidence: number | null;
+  sampleCount: number;
+  agreeingSamples: number;
+  warning: string;
+  manuallyAdjusted: boolean;
 };
 
 type ItemSettings = {
@@ -81,6 +119,7 @@ type QueueItem = {
   lastProbe: ProbeResult | null;
   status: "idle" | "loading" | "ready" | "error";
   errorMessage: string;
+  blackBorderDetection: BlackBorderDetectionState;
   settings: ItemSettings;
 };
 
@@ -104,12 +143,14 @@ type BatchState = {
 const state: {
   mode: MediaMode;
   exportBusy: boolean;
+  detectionBusy: boolean;
   exportingMode: MediaMode | null;
   previewRequestId: number;
   modes: Record<MediaMode, ModeContext>;
 } = {
   mode: "image",
   exportBusy: false,
+  detectionBusy: false,
   exportingMode: null,
   previewRequestId: 0,
   modes: {
@@ -147,6 +188,12 @@ const scaleInput = document.querySelector<HTMLInputElement>("#scale");
 const scaleValueEl = document.querySelector<HTMLElement>("#scale-value");
 const imageSettingsEl = document.querySelector<HTMLElement>("#image-settings");
 const videoSettingsEl = document.querySelector<HTMLElement>("#video-settings");
+const autoDetectBlackBordersEl = document.querySelector<HTMLInputElement>("#auto-detect-black-borders");
+const detectCurrentButton = document.querySelector<HTMLButtonElement>("#detect-black-borders-current");
+const detectAllButton = document.querySelector<HTMLButtonElement>("#detect-black-borders-all");
+const blackBorderStatusEl = document.querySelector<HTMLElement>("#black-border-status");
+const blackBorderConfidenceEl = document.querySelector<HTMLElement>("#black-border-confidence");
+const blackBorderDetailEl = document.querySelector<HTMLElement>("#black-border-detail");
 const imageFormatSelect = document.querySelector<HTMLSelectElement>("#image-format");
 const videoRangeSummaryEl = document.querySelector<HTMLElement>("#video-range-summary");
 const previewEmptyEl = document.querySelector<HTMLElement>("#preview-empty");
@@ -178,6 +225,19 @@ let videoPreviewTimer: number | null = null;
 let videoPlaybackTimer: number | null = null;
 let videoPreviewPlaying = false;
 const MIN_VIDEO_SEGMENT_SECONDS = 0.5;
+const BLACK_BORDER_SAMPLE_WINDOWS = 7;
+
+function createBlackBorderDetectionState(): BlackBorderDetectionState {
+  return {
+    status: "not_run",
+    margins: { left: 0, top: 0, right: 0, bottom: 0 },
+    confidence: null,
+    sampleCount: 0,
+    agreeingSamples: 0,
+    warning: "",
+    manuallyAdjusted: false,
+  };
+}
 
 function createItemSettings(): ItemSettings {
   return {
@@ -212,40 +272,50 @@ function currentItem(mode = state.mode) {
   return context.items[context.currentIndex] ?? null;
 }
 
+function getProbeDisplaySize(probe: ProbeResult | null | undefined) {
+  return {
+    width: probe?.display_width ?? probe?.width ?? 0,
+    height: probe?.display_height ?? probe?.height ?? 0,
+  };
+}
+
+function getItemSourceSize(item: QueueItem | null | undefined) {
+  return getProbeDisplaySize(item?.lastProbe);
+}
+
 function getRenderedSourceSize(mode = state.mode) {
   const item = currentItem(mode);
   if (!item) {
     return { width: 0, height: 0 };
   }
 
+  const sourceSize = getItemSourceSize(item);
+
   if (mode === state.mode) {
     if (usingNativeVideoPreview(item) && previewVideoEl && !previewVideoEl.classList.contains("hide")) {
       return {
-        width: previewVideoEl.videoWidth || item.lastProbe?.width || 0,
-        height: previewVideoEl.videoHeight || item.lastProbe?.height || 0,
+        width: previewVideoEl.videoWidth || sourceSize.width,
+        height: previewVideoEl.videoHeight || sourceSize.height,
       };
     }
 
     if (item.previewSrc && previewImageEl && !previewImageEl.classList.contains("hide")) {
       return {
-        width: previewImageEl.naturalWidth || item.lastProbe?.width || 0,
-        height: previewImageEl.naturalHeight || item.lastProbe?.height || 0,
+        width: previewImageEl.naturalWidth || sourceSize.width,
+        height: previewImageEl.naturalHeight || sourceSize.height,
       };
     }
   }
 
-  return {
-    width: item.lastProbe?.width ?? 0,
-    height: item.lastProbe?.height ?? 0,
-  };
+  return sourceSize;
 }
 
 function getSourceWidth(mode = state.mode) {
-  return getRenderedSourceSize(mode).width;
+  return getItemSourceSize(currentItem(mode)).width;
 }
 
 function getSourceHeight(mode = state.mode) {
-  return getRenderedSourceSize(mode).height;
+  return getItemSourceSize(currentItem(mode)).height;
 }
 
 function getMediaExtensions(mode: MediaMode) {
@@ -311,25 +381,58 @@ function setProgress(percent: number, text: string) {
 
 function setButtonsDisabledState() {
   const hasCurrent = Boolean(currentItem());
-  const disabled = !hasCurrent || state.exportBusy;
+  const busy = isOperationBusy();
+  const disabled = !hasCurrent || busy;
   if (exportButton) {
     exportButton.disabled = disabled;
   }
   if (pickInputButton) {
-    pickInputButton.disabled = state.exportBusy;
+    pickInputButton.disabled = busy;
+  }
+  if (pickInputSecondaryButton) {
+    pickInputSecondaryButton.disabled = busy;
   }
   if (applyCurrentToAllButton) {
-    applyCurrentToAllButton.disabled = !hasCurrent || state.exportBusy;
+    applyCurrentToAllButton.disabled = !hasCurrent || busy;
   }
   if (clearQueueButton) {
-    clearQueueButton.disabled = currentContext().items.length === 0 || state.exportBusy;
+    clearQueueButton.disabled = currentContext().items.length === 0 || busy;
   }
   if (batchExportButton) {
-    batchExportButton.disabled = currentContext().items.length === 0 || state.exportBusy;
+    batchExportButton.disabled = currentContext().items.length === 0 || busy;
   }
   if (applyCustomRatioButton) {
-    applyCustomRatioButton.disabled = !hasCurrent || state.exportBusy;
+    applyCustomRatioButton.disabled = !hasCurrent || busy;
   }
+  ratioButtons.forEach((button) => {
+    button.disabled = disabled;
+  });
+  anchorButtons.forEach((button) => {
+    button.disabled = disabled;
+  });
+  if (ratioSelect) ratioSelect.disabled = disabled;
+  if (anchorSelect) anchorSelect.disabled = disabled;
+  if (scaleInput) scaleInput.disabled = disabled;
+  if (customRatioWidthInput) customRatioWidthInput.disabled = disabled;
+  if (customRatioHeightInput) customRatioHeightInput.disabled = disabled;
+  if (imageFormatSelect) imageFormatSelect.disabled = disabled;
+  if (videoPreviewSeekEl) videoPreviewSeekEl.disabled = disabled;
+  if (videoPreviewToggleEl) videoPreviewToggleEl.disabled = disabled;
+  if (videoExportStartEl) videoExportStartEl.disabled = disabled;
+  if (videoExportEndEl) videoExportEndEl.disabled = disabled;
+  if (detectCurrentButton) {
+    detectCurrentButton.disabled = state.mode !== "video" || !currentItem()?.lastProbe || busy;
+  }
+  if (detectAllButton) {
+    detectAllButton.disabled =
+      state.mode !== "video" || currentContext("video").items.length === 0 || busy;
+  }
+  if (autoDetectBlackBordersEl) {
+    autoDetectBlackBordersEl.disabled = busy;
+  }
+  modeTabs.forEach((tab) => {
+    tab.disabled = busy;
+  });
 }
 
 function formatClock(seconds?: number) {
@@ -349,15 +452,8 @@ function currentMediaEl() {
   return previewImageEl;
 }
 
-function shouldResetRectForRenderedSource(item = currentItem()) {
-  if (!item?.lastProbe) {
-    return false;
-  }
-  const rendered = getRenderedSourceSize();
-  if (!rendered.width || !rendered.height) {
-    return false;
-  }
-  return rendered.width !== (item.lastProbe.width ?? 0) || rendered.height !== (item.lastProbe.height ?? 0);
+function isOperationBusy() {
+  return state.exportBusy || state.detectionBusy;
 }
 
 function resetPreviewLayout() {
@@ -445,6 +541,92 @@ function syncControlsFromState() {
   updateScaleLabel();
   syncRatioButtons();
   syncAnchorButtons();
+}
+
+function blackBorderStatusLabel(status: BlackBorderDetectionStatus, compact = false) {
+  if (status === "detecting") return compact ? "检测中" : "正在检测黑边…";
+  if (status === "detected") return compact ? "已去黑边" : "已检测到黑边";
+  if (status === "no_border") return compact ? "无黑边" : "未发现黑边";
+  if (status === "needs_review") return compact ? "需确认" : "检测结果需要确认";
+  if (status === "failed") return compact ? "失败" : "黑边检测失败";
+  return compact ? "未检测" : "尚未检测";
+}
+
+function itemBlackBorderStatusLabel(item: QueueItem, compact = false) {
+  if (item.blackBorderDetection.manuallyAdjusted) {
+    return compact ? "已调整" : "裁切框已手动调整";
+  }
+  return blackBorderStatusLabel(item.blackBorderDetection.status, compact);
+}
+
+function markCropManuallyAdjusted(item: QueueItem | null) {
+  if (
+    !item ||
+    ["not_run", "detecting"].includes(item.blackBorderDetection.status) ||
+    item.blackBorderDetection.manuallyAdjusted
+  ) {
+    return;
+  }
+  item.blackBorderDetection.manuallyAdjusted = true;
+  if (state.mode === "video" && currentItem("video") === item) {
+    syncBlackBorderDetectionUi();
+  }
+}
+
+function invalidateDetectionForSegmentChange(item: QueueItem) {
+  const detection = item.blackBorderDetection;
+  if (
+    detection.manuallyAdjusted ||
+    !["detected", "no_border"].includes(detection.status)
+  ) {
+    return;
+  }
+
+  detection.status = "needs_review";
+  detection.confidence = null;
+  detection.warning = "输出片段已改变，请重新检测黑边后再批量导出。";
+  syncBlackBorderDetectionUi();
+  renderThumbs();
+}
+
+function formatConfidence(confidence: number | null) {
+  if (confidence === null || !Number.isFinite(confidence)) {
+    return "";
+  }
+  const percent = confidence <= 1 ? confidence * 100 : confidence;
+  return `置信度 ${Math.round(Math.max(0, Math.min(100, percent)))}%`;
+}
+
+function syncBlackBorderDetectionUi() {
+  const item = state.mode === "video" ? currentItem("video") : null;
+  const detection = item?.blackBorderDetection ?? createBlackBorderDetectionState();
+  if (blackBorderStatusEl) {
+    blackBorderStatusEl.textContent = item ? itemBlackBorderStatusLabel(item) : blackBorderStatusLabel(detection.status);
+    blackBorderStatusEl.dataset.status = detection.status;
+  }
+  if (blackBorderConfidenceEl) {
+    blackBorderConfidenceEl.textContent = formatConfidence(detection.confidence);
+  }
+  if (!blackBorderDetailEl) {
+    return;
+  }
+
+  if (detection.manuallyAdjusted) {
+    blackBorderDetailEl.textContent = "当前使用手动调整后的裁切区域。";
+  } else if (detection.warning) {
+    blackBorderDetailEl.textContent = detection.warning;
+  } else if (detection.status === "detected") {
+    const { left, top, right, bottom } = detection.margins;
+    blackBorderDetailEl.textContent = `裁去：上 ${top}px · 右 ${right}px · 下 ${bottom}px · 左 ${left}px`;
+  } else if (detection.status === "no_border") {
+    blackBorderDetailEl.textContent = "已使用视频完整画幅。";
+  } else if (detection.status === "needs_review") {
+    blackBorderDetailEl.textContent = "未自动修改当前裁切框。";
+  } else if (detection.status === "failed") {
+    blackBorderDetailEl.textContent = "可稍后重试或继续手动裁切。";
+  } else {
+    blackBorderDetailEl.textContent = "将从多个时间点采样并自动应用可靠结果。";
+  }
 }
 
 function getVideoSegmentEnd(item: QueueItem) {
@@ -719,6 +901,7 @@ function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
     lastProbe: null,
     status: "loading",
     errorMessage: "",
+    blackBorderDetection: createBlackBorderDetectionState(),
     settings: createItemSettings(),
   };
 }
@@ -760,6 +943,7 @@ function renderThumbs() {
   context.items.forEach((item, index) => {
     const thumb = document.createElement("button");
     thumb.type = "button";
+    thumb.disabled = isOperationBusy();
     thumb.className = `thumb${index === context.currentIndex ? " active" : ""}`;
 
     const media =
@@ -767,18 +951,22 @@ function renderThumbs() {
         ? `<img src="${item.previewSrc}" alt="">`
         : `<div class="thumb-fallback">${state.mode === "image" ? "IMG" : "VID"}</div>`;
     const ratio = item.settings.ratio === "free" ? "自由" : item.settings.ratio;
+    const sourceSize = getItemSourceSize(item);
     const detail = item.lastProbe
-      ? `${item.lastProbe.width ?? "-"}×${item.lastProbe.height ?? "-"}${item.lastProbe.duration_seconds ? ` · ${item.lastProbe.duration_seconds.toFixed(2)}s` : ""}`
+      ? `${sourceSize.width || "-"}×${sourceSize.height || "-"}${item.lastProbe.duration_seconds ? ` · ${item.lastProbe.duration_seconds.toFixed(2)}s` : ""}`
       : item.status === "error"
         ? "读取失败"
         : "加载中...";
+    const detection = state.mode === "video"
+      ? `<div class="thumb-detection status-${item.blackBorderDetection.status}">${itemBlackBorderStatusLabel(item, true)}</div>`
+      : "";
 
     thumb.innerHTML = `
       ${media}
       <div class="thumb-meta">
         <div class="thumb-name">${item.name}</div>
         <div class="thumb-info">${detail}</div>
-        <div class="thumb-ratio">${ratio}</div>
+        <div class="thumb-footer"><span class="thumb-ratio">${ratio}</span>${detection}</div>
       </div>
       <span class="thumb-delete" data-delete="true">×</span>
     `;
@@ -958,10 +1146,14 @@ function renderMediaSummary() {
   }
 
   const probe = item.lastProbe;
+  const sourceSize = getProbeDisplaySize(probe);
   const parts = [
-    `${probe.width ?? "-"}×${probe.height ?? "-"}`,
+    `${sourceSize.width || "-"}×${sourceSize.height || "-"}`,
     probe.codec_name ?? probe.format_name ?? "unknown",
   ];
+  if (probe.rotation_degrees) {
+    parts.push(`旋转 ${probe.rotation_degrees}°`);
+  }
   if (probe.duration_seconds) {
     parts.push(formatDuration(probe.duration_seconds));
   }
@@ -1114,6 +1306,7 @@ function renderCurrentContext() {
     logOutputEl.textContent = context.log;
   }
   syncControlsFromState();
+  syncBlackBorderDetectionUi();
   renderMediaSummary();
   setProgress(context.progressPercent, context.progressText);
   renderThumbs();
@@ -1125,6 +1318,163 @@ function renderCurrentContext() {
   updateVideoTimelineUi();
   drawCropBox();
   panelShellEl?.classList.toggle("disabled", !item);
+}
+
+function normalizeDetectedRect(rect: CropRect, item: QueueItem) {
+  const { width: sourceWidth, height: sourceHeight } = getItemSourceSize(item);
+  if (
+    sourceWidth <= 0 ||
+    sourceHeight <= 0 ||
+    ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) ||
+    rect.width < 2 ||
+    rect.height < 2
+  ) {
+    return null;
+  }
+
+  const x = Math.max(0, Math.min(sourceWidth - 2, rect.x));
+  const y = Math.max(0, Math.min(sourceHeight - 2, rect.y));
+  return {
+    x,
+    y,
+    width: Math.max(2, Math.min(rect.width, sourceWidth - x)),
+    height: Math.max(2, Math.min(rect.height, sourceHeight - y)),
+  };
+}
+
+function refreshDetectionPresentation(mode: MediaMode, item: QueueItem) {
+  if (mode !== state.mode) {
+    return;
+  }
+  renderThumbs();
+  if (currentItem(mode) === item) {
+    syncControlsFromState();
+    syncBlackBorderDetectionUi();
+    drawCropBox();
+  }
+  setButtonsDisabledState();
+}
+
+async function detectBlackBordersForItem(item: QueueItem, mode: MediaMode) {
+  const detection = item.blackBorderDetection;
+  detection.status = "detecting";
+  detection.warning = "";
+  detection.manuallyAdjusted = false;
+  refreshDetectionPresentation(mode, item);
+
+  if (mode !== "video" || !item.lastProbe) {
+    detection.status = "failed";
+    detection.warning = "尚未读取到有效的视频信息。";
+    refreshDetectionPresentation(mode, item);
+    return detection.status;
+  }
+
+  const totalDuration = item.lastProbe.duration_seconds ?? 0;
+  const startSeconds = Math.max(0, item.settings.videoStartSeconds);
+  const durationSeconds = totalDuration > 0
+    ? Math.max(0, Math.min(item.settings.videoDurationSeconds, totalDuration - startSeconds))
+    : undefined;
+
+  try {
+    const result = await invoke<BlackBorderDetectionResult>("detect_black_borders", {
+      request: {
+        inputPath: item.inputPath,
+        startSeconds,
+        durationSeconds,
+        sampleWindows: BLACK_BORDER_SAMPLE_WINDOWS,
+      },
+    });
+
+    detection.status = result.status;
+    detection.margins = result.margins;
+    detection.confidence = result.confidence;
+    detection.sampleCount = result.sampleCount;
+    detection.agreeingSamples = result.agreeingSamples;
+    detection.warning = result.warning ?? "";
+    detection.manuallyAdjusted = false;
+
+    if (result.status === "detected") {
+      const nextRect = result.rect ? normalizeDetectedRect(result.rect, item) : null;
+      if (!nextRect) {
+        detection.status = "failed";
+        detection.warning = detection.warning || "检测结果没有包含有效的裁切区域。";
+      } else {
+        item.settings.ratio = "free";
+        item.settings.scale = 1;
+        item.settings.rect = nextRect;
+      }
+    } else if (result.status === "no_border") {
+      const { width, height } = getItemSourceSize(item);
+      if (width > 0 && height > 0) {
+        item.settings.ratio = "free";
+        item.settings.scale = 1;
+        item.settings.rect = { x: 0, y: 0, width, height };
+      } else {
+        detection.status = "failed";
+        detection.warning = detection.warning || "无法确定视频的显示尺寸。";
+      }
+    }
+  } catch (error) {
+    detection.status = "failed";
+    detection.confidence = null;
+    detection.sampleCount = 0;
+    detection.agreeingSamples = 0;
+    detection.warning = String(error);
+  }
+
+  refreshDetectionPresentation(mode, item);
+  return detection.status;
+}
+
+function setModeProgress(mode: MediaMode, percent: number, text: string) {
+  const context = currentContext(mode);
+  context.progressPercent = Math.max(0, Math.min(100, percent));
+  context.progressText = text;
+  if (mode === state.mode) {
+    setProgress(context.progressPercent, context.progressText);
+  }
+}
+
+async function runBlackBorderDetection(items: QueueItem[], mode: MediaMode, automatic = false) {
+  if (mode !== "video" || items.length === 0 || isOperationBusy()) {
+    return;
+  }
+
+  const context = currentContext(mode);
+  state.detectionBusy = true;
+  setButtonsDisabledState();
+  const logLines: string[] = [];
+
+  try {
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const prefix = automatic ? "正在自动检测" : "正在检测";
+      const progressText = `${prefix}黑边 ${index + 1}/${items.length}：${item.name}`;
+      context.log = progressText;
+      if (mode === state.mode && logOutputEl) {
+        logOutputEl.textContent = context.log;
+      }
+      setModeProgress(mode, (index / items.length) * 100, progressText);
+
+      const status = await detectBlackBordersForItem(item, mode);
+      logLines.push(`[${index + 1}/${items.length}] ${item.name}：${blackBorderStatusLabel(status)}`);
+      setModeProgress(mode, ((index + 1) / items.length) * 100, `黑边检测 ${index + 1}/${items.length} 完成`);
+    }
+
+    const reviewCount = items.filter((item) => item.blackBorderDetection.status === "needs_review").length;
+    const failedCount = items.filter((item) => item.blackBorderDetection.status === "failed").length;
+    const appliedCount = items.length - reviewCount - failedCount;
+    const summary = `黑边检测完成：${appliedCount} 个已应用，${reviewCount} 个需确认，${failedCount} 个失败。`;
+    context.log = [summary, "", ...logLines].join("\n");
+    setModeProgress(mode, 100, summary);
+  } finally {
+    state.detectionBusy = false;
+    if (mode === state.mode) {
+      renderCurrentContext();
+    } else {
+      setButtonsDisabledState();
+    }
+  }
 }
 
 async function autoProbeMedia(mode = state.mode) {
@@ -1161,6 +1511,12 @@ async function autoProbeMedia(mode = state.mode) {
       item.settings.videoDurationSeconds = totalDuration;
       item.previewSeconds = 0;
       clampVideoSettings(mode);
+      if (autoDetectBlackBordersEl?.checked ?? true) {
+        await runBlackBorderDetection([item], mode, true);
+        if (context.loadToken !== loadToken) {
+          return;
+        }
+      }
       if (canUseNativeVideoPreview(item)) {
         try {
           const previewVideo = await invoke<PreviewVideoAssetResult>("build_preview_video_asset", {
@@ -1414,7 +1770,7 @@ function bindCropDragging() {
 
   cropBoxEl?.addEventListener("mousedown", (event) => {
     const item = currentItem();
-    if (!item?.lastProbe || !item.settings.rect || state.exportBusy) {
+    if (!item?.lastProbe || !item.settings.rect || isOperationBusy()) {
       return;
     }
     const target = event.target as HTMLElement;
@@ -1431,6 +1787,8 @@ function bindCropDragging() {
     if (!mode || !startRect || !item?.lastProbe || !item.settings.rect) {
       return;
     }
+
+    markCropManuallyAdjusted(item);
 
     const scale = mediaScale();
     const dx = (event.clientX - startX) / scale;
@@ -1622,6 +1980,10 @@ async function bindExportProgressEvents() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  const savedAutoDetection = localStorage.getItem("media-cropper-auto-detect-black-borders");
+  if (autoDetectBlackBordersEl && savedAutoDetection !== null) {
+    autoDetectBlackBordersEl.checked = savedAutoDetection === "true";
+  }
   void bindExportProgressEvents();
   bindCropDragging();
   updateModeUi();
@@ -1657,11 +2019,28 @@ window.addEventListener("DOMContentLoaded", () => {
     void exportBatch();
   });
 
+  detectCurrentButton?.addEventListener("click", () => {
+    const item = currentItem("video");
+    if (!item) {
+      return;
+    }
+    void runBlackBorderDetection([item], "video");
+  });
+
+  detectAllButton?.addEventListener("click", () => {
+    void runBlackBorderDetection([...currentContext("video").items], "video");
+  });
+
+  autoDetectBlackBordersEl?.addEventListener("change", () => {
+    localStorage.setItem("media-cropper-auto-detect-black-borders", String(autoDetectBlackBordersEl.checked));
+  });
+
   ratioSelect?.addEventListener("change", () => {
     const item = currentItem();
     if (!item) {
       return;
     }
+    markCropManuallyAdjusted(item);
     item.settings.ratio = getSelectedRatio();
     item.settings.rect = null;
     ensureRect();
@@ -1675,6 +2054,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item) {
       return;
     }
+    markCropManuallyAdjusted(item);
     item.settings.anchor = getSelectedAnchor();
     if (item.settings.rect) {
       positionRectByAnchor();
@@ -1724,6 +2104,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item) {
       return;
     }
+    markCropManuallyAdjusted(item);
     item.settings.scale = getSelectedScale();
     updateScaleLabel();
     if (ratioValue() !== null) {
@@ -1795,6 +2176,7 @@ window.addEventListener("DOMContentLoaded", () => {
     item.settings.videoDurationSeconds = Math.max(MIN_VIDEO_SEGMENT_SECONDS, end - nextStart);
     item.previewSeconds = nextStart;
     clampVideoSettings();
+    invalidateDetectionForSegmentChange(item);
     updateVideoTimelineUi();
     if (usingNativeVideoPreview(item) && previewVideoEl) {
       previewVideoEl.currentTime = item.previewSeconds;
@@ -1814,6 +2196,7 @@ window.addEventListener("DOMContentLoaded", () => {
     item.settings.videoDurationSeconds = Math.max(MIN_VIDEO_SEGMENT_SECONDS, Math.min(duration, nextEnd) - start);
     item.previewSeconds = Math.min(duration, nextEnd);
     clampVideoSettings();
+    invalidateDetectionForSegmentChange(item);
     updateVideoTimelineUi();
     if (usingNativeVideoPreview(item) && previewVideoEl) {
       previewVideoEl.currentTime = item.previewSeconds;
@@ -1849,10 +2232,6 @@ window.addEventListener("DOMContentLoaded", () => {
     const item = currentItem();
     if (!item || !usingNativeVideoPreview(item) || !previewVideoEl) {
       return;
-    }
-    if (shouldResetRectForRenderedSource(item)) {
-      item.settings.rect = null;
-      ensureRect();
     }
     previewVideoEl.currentTime = Math.min(item.previewSeconds, previewVideoEl.duration || item.previewSeconds);
     item.status = "ready";
@@ -1913,6 +2292,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const actualScale = sourceFit ? Math.max(0.1, Math.min(1, sourceRect.width / sourceFit.width)) : source.settings.scale;
 
     context.items.forEach((item) => {
+      markCropManuallyAdjusted(item);
       item.settings.ratio = source.settings.ratio;
       item.settings.anchor = source.settings.anchor;
       item.settings.scale = actualScale;
@@ -1921,8 +2301,7 @@ window.addEventListener("DOMContentLoaded", () => {
       item.settings.videoStartSeconds = source.settings.videoStartSeconds;
       item.settings.videoDurationSeconds = source.settings.videoDurationSeconds;
 
-      const width = item.lastProbe?.width ?? 0;
-      const height = item.lastProbe?.height ?? 0;
+      const { width, height } = getItemSourceSize(item);
       if (!width || !height) {
         item.settings.rect = null;
         return;
@@ -1965,7 +2344,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   clearQueueButton?.addEventListener("click", () => {
     const context = currentContext();
-    if (state.exportBusy) {
+    if (isOperationBusy()) {
       return;
     }
     context.items = [];
@@ -1976,11 +2355,6 @@ window.addEventListener("DOMContentLoaded", () => {
     renderCurrentContext();
   });
   previewImageEl?.addEventListener("load", () => {
-    const item = currentItem();
-    if (item && shouldResetRectForRenderedSource(item)) {
-      item.settings.rect = null;
-      ensureRect();
-    }
     syncPreviewLayout();
     drawCropBox();
   });

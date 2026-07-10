@@ -166,7 +166,22 @@
           </section>
 
           <section class="inspector-section hide" id="video-settings">
-            <h2>导出</h2>
+            <h2>黑边检测</h2>
+            <div class="black-border-controls">
+              <label class="toggle-row" for="auto-detect-black-borders">
+                <input id="auto-detect-black-borders" type="checkbox" checked />
+                <span>导入后自动检测</span>
+              </label>
+              <div class="detection-actions">
+                <button id="detect-black-borders-current" type="button" class="ghost-button" disabled>检测当前</button>
+                <button id="detect-black-borders-all" type="button" class="ghost-button" disabled>检测全部</button>
+              </div>
+              <div class="detection-status-row">
+                <span id="black-border-status" data-status="not_run">尚未检测</span>
+                <span id="black-border-confidence"></span>
+              </div>
+              <div class="detection-detail" id="black-border-detail">将从多个时间点采样并自动应用可靠结果。</div>
+            </div>
             <div class="settings-grid">
               <div class="field">
                 <span class="label">输出片段</span>

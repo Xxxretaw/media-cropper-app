@@ -495,6 +495,31 @@ button:disabled,
   color: var(--text-thumb-ratio);
 }
 
+.thumb-footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.thumb-detection {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thumb-detection.status-detected,
+.thumb-detection.status-no_border {
+  color: var(--accent-light);
+}
+
+.thumb-detection.status-needs_review,
+.thumb-detection.status-failed {
+  color: var(--text-error);
+}
+
 .thumb-delete {
   min-width: auto;
   padding: 2px 6px;
@@ -859,6 +884,71 @@ h2 {
 .settings-grid {
   display: grid;
   gap: 12px;
+}
+
+.black-border-controls {
+  display: grid;
+  gap: 9px;
+}
+
+.toggle-row {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.toggle-row input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.detection-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.detection-actions button {
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.detection-status-row {
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+#black-border-status[data-status="detected"],
+#black-border-status[data-status="no_border"] {
+  color: var(--accent-light);
+}
+
+#black-border-status[data-status="needs_review"],
+#black-border-status[data-status="failed"] {
+  color: var(--text-error);
+}
+
+#black-border-confidence {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.detection-detail {
+  min-height: 34px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
 }
 
 .field-range {

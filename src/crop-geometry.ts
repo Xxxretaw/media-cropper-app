@@ -89,12 +89,21 @@ export function createRectForRatio(
   scale: number,
   anchor: string,
 ): CropRect {
+  const safeScale = Number.isFinite(scale) ? Math.max(0.1, Math.min(1, scale)) : 1;
   if (ratio === null) {
-    return { ...bounds };
+    return positionRectInBounds(
+      {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width * safeScale,
+        height: bounds.height * safeScale,
+      },
+      bounds,
+      anchor,
+    );
   }
 
   const fitted = maxFit(bounds.width, bounds.height, ratio);
-  const safeScale = Number.isFinite(scale) ? Math.max(0.1, Math.min(1, scale)) : 1;
   return positionRectInBounds(
     {
       x: bounds.x,
@@ -104,5 +113,61 @@ export function createRectForRatio(
     },
     bounds,
     anchor,
+  );
+}
+
+export function resizeRectAroundCenter(
+  rect: CropRect,
+  bounds: CropRect,
+  scale: number,
+  ratio: number | null,
+): CropRect {
+  const rectRatio = rect.height > 0 ? rect.width / rect.height : 0;
+  const effectiveRatio = ratio ?? rectRatio;
+  if (!Number.isFinite(effectiveRatio) || effectiveRatio <= 0) {
+    return clampRectToBounds(rect, bounds);
+  }
+
+  const safeScale = Number.isFinite(scale) ? Math.max(0.1, Math.min(1, scale)) : 1;
+  const fitted = maxFit(bounds.width, bounds.height, effectiveRatio);
+  const width = fitted.width * safeScale;
+  const height = fitted.height * safeScale;
+  const centerX = rect.x + rect.width / 2;
+  const centerY = rect.y + rect.height / 2;
+
+  return clampRectToBounds(
+    {
+      x: centerX - width / 2,
+      y: centerY - height / 2,
+      width,
+      height,
+    },
+    bounds,
+  );
+}
+
+export function scaleForRect(
+  rect: CropRect,
+  bounds: CropRect,
+  ratio: number | null,
+): number {
+  const rectRatio = rect.height > 0 ? rect.width / rect.height : 0;
+  const effectiveRatio = ratio ?? rectRatio;
+  if (
+    !Number.isFinite(effectiveRatio) ||
+    effectiveRatio <= 0 ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    return 1;
+  }
+
+  const fitted = maxFit(bounds.width, bounds.height, effectiveRatio);
+  if (fitted.width <= 0 || fitted.height <= 0) {
+    return 1;
+  }
+  return Math.max(
+    0.1,
+    Math.min(1, Math.min(rect.width / fitted.width, rect.height / fitted.height)),
   );
 }

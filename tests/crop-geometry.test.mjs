@@ -4,6 +4,8 @@ import {
   clampRectToBounds,
   contentBoundsFromMargins,
   createRectForRatio,
+  resizeRectAroundCenter,
+  scaleForRect,
 } from "../src/crop-geometry.ts";
 
 const detectedBounds = contentBoundsFromMargins(1920, 1080, {
@@ -22,6 +24,26 @@ test("detected margins become the base bounds for later ratio crops", () => {
 
 test("free ratio restores the detected content bounds instead of the full source", () => {
   assert.deepEqual(createRectForRatio(detectedBounds, null, 1, "center"), detectedBounds);
+});
+
+test("free ratio scale creates a crop linked to the scale control", () => {
+  assert.deepEqual(createRectForRatio(detectedBounds, null, 0.5, "center"), {
+    x: 480,
+    y: 340,
+    width: 960,
+    height: 400,
+  });
+});
+
+test("free ratio keeps its current aspect while scaling around its center", () => {
+  const rect = { x: 560, y: 340, width: 800, height: 400 };
+  assert.deepEqual(resizeRectAroundCenter(rect, detectedBounds, 0.75, null), {
+    x: 360,
+    y: 240,
+    width: 1200,
+    height: 600,
+  });
+  assert.equal(scaleForRect(rect, detectedBounds, null), 0.5);
 });
 
 test("anchor and scale stay inside the detected content bounds", () => {

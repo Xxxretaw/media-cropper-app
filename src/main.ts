@@ -7,167 +7,44 @@ import {
   createRectForRatio,
   maxFit,
   positionRectInBounds,
+  resizeRectAroundCenter,
+  scaleForRect,
   type CropRect,
 } from "./crop-geometry";
+import {
+  createAppState,
+  createBatchState,
+  createBlackBorderDetectionState,
+  createQueueItem,
+  getItemSourceSize,
+  getProbeDisplaySize,
+  type BlackBorderDetectionResult,
+  type BlackBorderDetectionStatus,
+  type ExportProgressEvent,
+  type ExportRequest,
+  type ExportResult,
+  type MediaMode,
+  type PreviewDataUrlResult,
+  type PreviewVideoAssetResult,
+  type ProbeResult,
+  type QueueItem,
+} from "./media-model";
+import {
+  MEDIA_EXTENSIONS,
+  routeMediaPaths,
+  type RoutedMediaFile,
+} from "./media-files";
+import {
+  buildExportBaseNames,
+  buildExportFileName,
+  sanitizeMaterialName,
+} from "./export-naming";
+import { createQueueThumbnail } from "./queue-view";
+import { bindCropDragging } from "./crop-drag-controller";
+import { bindFileDropEvents } from "./file-drop";
 
-type MediaMode = "image" | "video";
-type HandleMode = "move" | "nw" | "ne" | "sw" | "se";
-
-type ProbeResult = {
-  media_kind: string;
-  format_name?: string;
-  codec_name?: string;
-  width?: number;
-  height?: number;
-  rotation_degrees?: number;
-  display_width?: number;
-  display_height?: number;
-  duration_seconds?: number;
-  bit_rate?: number;
-  raw: unknown;
-};
-
-type ExportResult = {
-  output_path: string;
-  applied_filter: string;
-  stderr: string;
-};
-
-type PreviewDataUrlResult = {
-  dataUrl: string;
-};
-
-type PreviewVideoAssetResult = {
-  filePath: string;
-};
-
-type ExportProgressEvent = {
-  phase: "start" | "running" | "completed" | "error";
-  percent: number;
-  currentSeconds?: number;
-  totalSeconds?: number;
-  message?: string;
-};
-
-type BlackBorderDetectionStatus =
-  | "not_run"
-  | "detecting"
-  | "detected"
-  | "no_border"
-  | "needs_review"
-  | "failed";
-
-type BlackBorderMargins = {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-};
-
-type BlackBorderDetectionResult = {
-  status: Exclude<BlackBorderDetectionStatus, "not_run" | "detecting">;
-  rect?: CropRect;
-  margins: BlackBorderMargins;
-  confidence: number;
-  sampleCount: number;
-  agreeingSamples: number;
-  warning?: string;
-};
-
-type BlackBorderDetectionState = {
-  status: BlackBorderDetectionStatus;
-  margins: BlackBorderMargins;
-  confidence: number | null;
-  sampleCount: number;
-  agreeingSamples: number;
-  warning: string;
-  manuallyAdjusted: boolean;
-};
-
-type ItemSettings = {
-  ratio: string;
-  anchor: string;
-  scale: number;
-  rect: CropRect | null;
-  imageFormat: string;
-  imageQuality: number;
-  videoStartSeconds: number;
-  videoDurationSeconds: number;
-};
-
-type ExportRequest = {
-  inputPath: string;
-  outputPath: string;
-  avoidOverwrite?: boolean;
-  mode: MediaMode;
-  ratio: string;
-  anchor: string;
-  scale: number;
-  imageFormat?: string;
-  imageQuality?: number;
-  videoStartSeconds?: number;
-  videoDurationSeconds?: number;
-  cropRect?: CropRect;
-};
-
-type QueueItem = {
-  id: string;
-  name: string;
-  inputPath: string;
-  outputPath: string;
-  previewSrc: string;
-  nativeVideoSrc: string;
-  previewSeconds: number;
-  lastProbe: ProbeResult | null;
-  status: "idle" | "loading" | "ready" | "error";
-  errorMessage: string;
-  blackBorderDetection: BlackBorderDetectionState;
-  settings: ItemSettings;
-};
-
-type ModeContext = {
-  items: QueueItem[];
-  currentIndex: number;
-  log: string;
-  progressPercent: number;
-  progressText: string;
-  loadToken: number;
-};
-
-type BatchState = {
-  active: boolean;
-  totalItems: number;
-  currentItemIndex: number;
-  completedItems: number;
-  outputDir: string;
-};
-
-const state: {
-  mode: MediaMode;
-  exportBusy: boolean;
-  detectionBusy: boolean;
-  exportingMode: MediaMode | null;
-  previewRequestId: number;
-  modes: Record<MediaMode, ModeContext>;
-} = {
-  mode: "image",
-  exportBusy: false,
-  detectionBusy: false,
-  exportingMode: null,
-  previewRequestId: 0,
-  modes: {
-    image: createModeContext(),
-    video: createModeContext(),
-  },
-};
-
-const batchState: BatchState = {
-  active: false,
-  totalItems: 0,
-  currentItemIndex: 0,
-  completedItems: 0,
-  outputDir: "",
-};
+const state = createAppState();
+const batchState = createBatchState();
 
 const modeTabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".mode-tab"));
 const pickInputButton = document.querySelector<HTMLButtonElement>("#pick-input-button");
@@ -197,6 +74,10 @@ const blackBorderStatusEl = document.querySelector<HTMLElement>("#black-border-s
 const blackBorderConfidenceEl = document.querySelector<HTMLElement>("#black-border-confidence");
 const blackBorderDetailEl = document.querySelector<HTMLElement>("#black-border-detail");
 const imageFormatSelect = document.querySelector<HTMLSelectElement>("#image-format");
+const materialNameInput = document.querySelector<HTMLInputElement>("#material-name-input");
+const originalFileNameEl = document.querySelector<HTMLElement>("#original-file-name");
+const exportNamePreviewEl = document.querySelector<HTMLElement>("#export-name-preview");
+const namingMessageEl = document.querySelector<HTMLElement>("#naming-message");
 const videoRangeSummaryEl = document.querySelector<HTMLElement>("#video-range-summary");
 const previewEmptyEl = document.querySelector<HTMLElement>("#preview-empty");
 const dropTitleEl = document.querySelector<HTMLElement>("#drop-title");
@@ -217,53 +98,19 @@ const videoExportEndTimeEl = document.querySelector<HTMLElement>("#video-export-
 const progressFillEl = document.querySelector<HTMLElement>("#progress-fill");
 const progressPercentEl = document.querySelector<HTMLElement>("#progress-percent");
 const progressTextEl = document.querySelector<HTMLElement>("#progress-text");
+const exportProgressSectionEl = document.querySelector<HTMLElement>("#export-progress-section");
 const applyCurrentToAllButton = document.querySelector<HTMLButtonElement>("#apply-current-to-all");
 const clearQueueButton = document.querySelector<HTMLButtonElement>("#clear-queue-button");
 const batchExportButton = document.querySelector<HTMLButtonElement>("#batch-export-button");
 const panelShellEl = document.querySelector<HTMLElement>("#panel-shell");
 const cropDimsEl = document.querySelector<HTMLElement>("#crop-dims");
 const themeToggleEl = document.querySelector<HTMLButtonElement>("#theme-toggle");
+const previewStageEl = document.querySelector<HTMLElement>("#preview-stage");
 let videoPreviewTimer: number | null = null;
 let videoPlaybackTimer: number | null = null;
 let videoPreviewPlaying = false;
 const MIN_VIDEO_SEGMENT_SECONDS = 0.5;
 const BLACK_BORDER_SAMPLE_WINDOWS = 7;
-
-function createBlackBorderDetectionState(): BlackBorderDetectionState {
-  return {
-    status: "not_run",
-    margins: { left: 0, top: 0, right: 0, bottom: 0 },
-    confidence: null,
-    sampleCount: 0,
-    agreeingSamples: 0,
-    warning: "",
-    manuallyAdjusted: false,
-  };
-}
-
-function createItemSettings(): ItemSettings {
-  return {
-    ratio: "9:16",
-    anchor: "center",
-    scale: 1,
-    rect: null,
-    imageFormat: "png",
-    imageQuality: 100,
-    videoStartSeconds: 0,
-    videoDurationSeconds: 5,
-  };
-}
-
-function createModeContext(): ModeContext {
-  return {
-    items: [],
-    currentIndex: -1,
-    log: "等待操作...",
-    progressPercent: 0,
-    progressText: "等待导出...",
-    loadToken: 0,
-  };
-}
 
 function currentContext(mode = state.mode) {
   return state.modes[mode];
@@ -272,17 +119,6 @@ function currentContext(mode = state.mode) {
 function currentItem(mode = state.mode) {
   const context = currentContext(mode);
   return context.items[context.currentIndex] ?? null;
-}
-
-function getProbeDisplaySize(probe: ProbeResult | null | undefined) {
-  return {
-    width: probe?.display_width ?? probe?.width ?? 0,
-    height: probe?.display_height ?? probe?.height ?? 0,
-  };
-}
-
-function getItemSourceSize(item: QueueItem | null | undefined) {
-  return getProbeDisplaySize(item?.lastProbe);
 }
 
 function getRenderedSourceSize(mode = state.mode) {
@@ -320,12 +156,6 @@ function getSourceHeight(mode = state.mode) {
   return getItemSourceSize(currentItem(mode)).height;
 }
 
-function getMediaExtensions(mode: MediaMode) {
-  return mode === "image"
-    ? ["jpg", "jpeg", "png", "bmp", "tif", "tiff"]
-    : ["mp4", "mov", "m4v", "mkv", "avi"];
-}
-
 function getSelectedScale() {
   return Number(scaleInput?.value ?? 100) / 100;
 }
@@ -346,12 +176,6 @@ function getImageFormatExtension() {
   return imageFormatSelect?.value ?? "png";
 }
 
-function getFileStem(filePath: string) {
-  const normalized = filePath.replace(/\\/g, "/");
-  const fileName = normalized.split("/").pop() ?? "output";
-  return fileName.replace(/\.[^.]+$/, "") || "output";
-}
-
 function setLog(message: string) {
   currentContext().log = message;
   if (logOutputEl) {
@@ -368,8 +192,10 @@ function setMediaSummary(message: string) {
 function setProgress(percent: number, text: string) {
   const context = currentContext();
   const safePercent = Math.max(0, Math.min(100, percent));
+  const isIdle = safePercent === 0 && text === "等待导出...";
   context.progressPercent = safePercent;
   context.progressText = text;
+  exportProgressSectionEl?.classList.toggle("hide", isIdle);
   if (progressFillEl) {
     progressFillEl.style.width = `${safePercent}%`;
   }
@@ -383,10 +209,14 @@ function setProgress(percent: number, text: string) {
 
 function setButtonsDisabledState() {
   const hasCurrent = Boolean(currentItem());
+  const hasValidCurrentName = Boolean(sanitizeMaterialName(currentItem()?.materialName ?? ""));
+  const hasInvalidQueueName = currentContext().items.some(
+    (item) => !sanitizeMaterialName(item.materialName),
+  );
   const busy = isOperationBusy();
   const disabled = !hasCurrent || busy;
   if (exportButton) {
-    exportButton.disabled = disabled;
+    exportButton.disabled = disabled || !hasValidCurrentName;
   }
   if (pickInputButton) {
     pickInputButton.disabled = busy;
@@ -401,7 +231,7 @@ function setButtonsDisabledState() {
     clearQueueButton.disabled = currentContext().items.length === 0 || busy;
   }
   if (batchExportButton) {
-    batchExportButton.disabled = currentContext().items.length === 0 || busy;
+    batchExportButton.disabled = currentContext().items.length === 0 || hasInvalidQueueName || busy;
   }
   if (applyCustomRatioButton) {
     applyCustomRatioButton.disabled = !hasCurrent || busy;
@@ -418,6 +248,7 @@ function setButtonsDisabledState() {
   if (customRatioWidthInput) customRatioWidthInput.disabled = disabled;
   if (customRatioHeightInput) customRatioHeightInput.disabled = disabled;
   if (imageFormatSelect) imageFormatSelect.disabled = disabled;
+  if (materialNameInput) materialNameInput.disabled = !hasCurrent || busy;
   if (videoPreviewSeekEl) videoPreviewSeekEl.disabled = disabled;
   if (videoPreviewToggleEl) videoPreviewToggleEl.disabled = disabled;
   if (videoExportStartEl) videoExportStartEl.disabled = disabled;
@@ -455,7 +286,7 @@ function currentMediaEl() {
 }
 
 function isOperationBusy() {
-  return state.exportBusy || state.detectionBusy;
+  return state.exportBusy || state.detectionBusy || state.importBusy;
 }
 
 function resetPreviewLayout() {
@@ -466,7 +297,10 @@ function resetPreviewLayout() {
 function updateModeUi() {
   const isImage = state.mode === "image";
   modeTabs.forEach((tab) => {
-    tab.classList.toggle("active", tab.dataset.mode === state.mode);
+    const mode = tab.dataset.mode === "image" ? "image" : "video";
+    const count = currentContext(mode).items.length;
+    tab.classList.toggle("active", mode === state.mode);
+    tab.textContent = `${mode === "image" ? "图片" : "视频"}${count > 0 ? ` · ${count}` : ""}`;
   });
   if (pickInputButton) {
     pickInputButton.textContent = isImage ? "添加图片" : "添加视频";
@@ -480,7 +314,72 @@ function updateModeUi() {
   imageSettingsEl?.classList.toggle("hide", !isImage);
   videoSettingsEl?.classList.toggle("hide", isImage);
   if (dropTitleEl && !currentItem()) {
-    dropTitleEl.textContent = isImage ? "拖入图片" : "拖入视频";
+    dropTitleEl.textContent = "拖入图片或视频";
+  }
+}
+
+function outputExtensionForItem(item: QueueItem, mode = state.mode) {
+  return mode === "image" ? item.settings.imageFormat || "png" : "mp4";
+}
+
+function exportFileNameForItem(item: QueueItem, mode = state.mode) {
+  return buildExportFileName(
+    currentContext(mode).items,
+    item.id,
+    outputExtensionForItem(item, mode),
+  );
+}
+
+function syncFileNamingUi() {
+  const item = currentItem();
+  if (!item) {
+    if (materialNameInput && document.activeElement !== materialNameInput) {
+      materialNameInput.value = "";
+    }
+    if (originalFileNameEl) originalFileNameEl.textContent = "—";
+    if (exportNamePreviewEl) {
+      exportNamePreviewEl.textContent = "—";
+      exportNamePreviewEl.removeAttribute("title");
+    }
+    if (namingMessageEl) {
+      namingMessageEl.textContent = "选择素材后可单独设置导出名称";
+      namingMessageEl.dataset.state = "";
+    }
+    return;
+  }
+
+  if (materialNameInput && document.activeElement !== materialNameInput) {
+    materialNameInput.value = item.materialName;
+  }
+  if (originalFileNameEl) {
+    originalFileNameEl.textContent = item.name;
+    originalFileNameEl.title = item.name;
+  }
+
+  const sanitizedName = sanitizeMaterialName(item.materialName);
+  const baseName = buildExportBaseNames(currentContext().items).get(item.id) ?? "";
+  const fileName = exportFileNameForItem(item);
+  if (exportNamePreviewEl) {
+    exportNamePreviewEl.textContent = fileName || "请输入有效的素材名称";
+    if (fileName) exportNamePreviewEl.title = fileName;
+    else exportNamePreviewEl.removeAttribute("title");
+  }
+
+  if (!namingMessageEl) {
+    return;
+  }
+  if (!sanitizedName) {
+    namingMessageEl.textContent = "素材名称不能为空或仅包含无效字符";
+    namingMessageEl.dataset.state = "error";
+  } else if (baseName !== sanitizedName) {
+    namingMessageEl.textContent = "检测到同名素材，已按队列顺序自动添加序号";
+    namingMessageEl.dataset.state = "duplicate";
+  } else if (sanitizedName !== item.materialName.trim()) {
+    namingMessageEl.textContent = "导出时会自动移除扩展名并替换文件名无效字符";
+    namingMessageEl.dataset.state = "duplicate";
+  } else {
+    namingMessageEl.textContent = "原始文件不会被修改 · F2 快速编辑";
+    namingMessageEl.dataset.state = "";
   }
 }
 
@@ -603,6 +502,12 @@ function formatConfidence(confidence: number | null) {
 function syncBlackBorderDetectionUi() {
   const item = state.mode === "video" ? currentItem("video") : null;
   const detection = item?.blackBorderDetection ?? createBlackBorderDetectionState();
+  if (
+    videoSettingsEl instanceof HTMLDetailsElement
+    && (detection.status === "needs_review" || detection.status === "failed")
+  ) {
+    videoSettingsEl.open = true;
+  }
   if (blackBorderStatusEl) {
     blackBorderStatusEl.textContent = item ? itemBlackBorderStatusLabel(item) : blackBorderStatusLabel(detection.status);
     blackBorderStatusEl.dataset.status = detection.status;
@@ -805,7 +710,7 @@ function startVideoPlayback() {
     const nextSeconds = Math.min((activeItem.previewSeconds ?? 0) + stepSeconds, total);
     activeItem.previewSeconds = nextSeconds;
     updateVideoTimelineUi();
-    void requestPreviewFrame("video", activeItem.previewSeconds);
+    void requestPreviewFrame(activeItem, "video", activeItem.previewSeconds);
 
     if (nextSeconds >= total) {
       stopVideoPlayback();
@@ -822,8 +727,28 @@ function scheduleVideoPreviewRefresh(delay = 140) {
     if (!item || state.mode !== "video") {
       return;
     }
-    void requestPreviewFrame("video", item.previewSeconds);
+    void requestPreviewFrame(item, "video", item.previewSeconds);
   }, delay);
+}
+
+async function releasePreviewAssetPath(filePath: string) {
+  if (!filePath) {
+    return;
+  }
+  try {
+    await invoke("delete_preview_asset", { filePath });
+  } catch (error) {
+    console.warn("Failed to release preview asset", error);
+  }
+}
+
+async function releasePreviewAsset(item: QueueItem) {
+  const filePath = item.previewAssetPath;
+  item.previewAssetPath = "";
+  item.nativeVideoSrc = "";
+  if (filePath) {
+    await releasePreviewAssetPath(filePath);
+  }
 }
 
 function clearPreviewDom() {
@@ -845,15 +770,14 @@ function clearPreviewDom() {
   cropBoxEl?.classList.add("hide");
 }
 
-async function requestPreviewFrame(mode = state.mode, previewSeconds?: number) {
+async function requestPreviewFrame(item: QueueItem, mode: MediaMode, previewSeconds?: number) {
   const context = currentContext(mode);
-  const item = currentItem(mode);
   if (!item?.inputPath) {
     return;
   }
 
-  state.previewRequestId += 1;
-  const requestId = state.previewRequestId;
+  item.previewRevision += 1;
+  const requestId = item.previewRevision;
   item.status = "loading";
   if (typeof previewSeconds === "number") {
     item.previewSeconds = Math.max(0, previewSeconds);
@@ -868,20 +792,27 @@ async function requestPreviewFrame(mode = state.mode, previewSeconds?: number) {
       inputPath: item.inputPath,
       previewTimeSeconds: mode === "video" ? item.previewSeconds : undefined,
     });
-    if (requestId !== state.previewRequestId || currentContext(mode) !== context) {
+    if (
+      requestId !== item.previewRevision ||
+      currentContext(mode) !== context ||
+      !context.items.includes(item)
+    ) {
       return;
     }
     item.previewSrc = preview.dataUrl;
+    if (!item.thumbnailSrc) {
+      item.thumbnailSrc = preview.dataUrl;
+    }
     item.status = "ready";
     item.errorMessage = "";
-    if (mode === state.mode) {
+    if (mode === state.mode && currentItem(mode) === item) {
       applyPreviewSource();
       renderThumbs();
       drawCropBox();
       updateVideoTimelineUi();
     }
   } catch (error) {
-    if (requestId !== state.previewRequestId) {
+    if (requestId !== item.previewRevision || !context.items.includes(item)) {
       return;
     }
     item.status = "error";
@@ -894,23 +825,36 @@ async function requestPreviewFrame(mode = state.mode, previewSeconds?: number) {
   }
 }
 
-function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
-  const normalized = inputPath.replace(/\\/g, "/");
-  const name = normalized.split("/").pop() ?? `${mode}-item`;
-  return {
-    id: `${mode}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name,
-    inputPath,
-    outputPath: "",
-    previewSrc: "",
-    nativeVideoSrc: "",
-    previewSeconds: 0,
-    lastProbe: null,
-    status: "loading",
-    errorMessage: "",
-    blackBorderDetection: createBlackBorderDetectionState(),
-    settings: createItemSettings(),
-  };
+async function requestThumbnailFrame(
+  item: QueueItem,
+  mode: MediaMode,
+  previewSeconds = 0,
+) {
+  if (item.thumbnailSrc || !item.inputPath) {
+    return;
+  }
+
+  const context = currentContext(mode);
+  const loadRevision = item.loadRevision;
+  try {
+    const preview = await invoke<PreviewDataUrlResult>("build_preview_data_url", {
+      inputPath: item.inputPath,
+      previewTimeSeconds: mode === "video" ? Math.max(0, previewSeconds) : undefined,
+    });
+    if (
+      item.loadRevision !== loadRevision ||
+      currentContext(mode) !== context ||
+      !context.items.includes(item)
+    ) {
+      return;
+    }
+    item.thumbnailSrc = preview.dataUrl;
+    if (mode === state.mode) {
+      renderThumbs();
+    }
+  } catch (error) {
+    console.warn("Failed to generate queue thumbnail", error);
+  }
 }
 
 function listLabel(mode = state.mode) {
@@ -928,7 +872,10 @@ function selectItem(index: number, mode = state.mode) {
 
 function removeItem(index: number, mode = state.mode) {
   const context = currentContext(mode);
-  context.items.splice(index, 1);
+  const [removed] = context.items.splice(index, 1);
+  if (removed) {
+    void releasePreviewAsset(removed);
+  }
   if (context.currentIndex >= context.items.length) {
     context.currentIndex = context.items.length - 1;
   }
@@ -945,18 +892,9 @@ function renderThumbs() {
   if (!thumbsEl) {
     return;
   }
-  thumbsEl.innerHTML = "";
+  thumbsEl.replaceChildren();
 
   context.items.forEach((item, index) => {
-    const thumb = document.createElement("button");
-    thumb.type = "button";
-    thumb.disabled = isOperationBusy();
-    thumb.className = `thumb${index === context.currentIndex ? " active" : ""}`;
-
-    const media =
-      item.previewSrc
-        ? `<img src="${item.previewSrc}" alt="">`
-        : `<div class="thumb-fallback">${state.mode === "image" ? "IMG" : "VID"}</div>`;
     const ratio = item.settings.ratio === "free" ? "自由" : item.settings.ratio;
     const sourceSize = getItemSourceSize(item);
     const detail = item.lastProbe
@@ -964,30 +902,27 @@ function renderThumbs() {
       : item.status === "error"
         ? "读取失败"
         : "加载中...";
-    const detection = state.mode === "video"
-      ? `<div class="thumb-detection status-${item.blackBorderDetection.status}">${itemBlackBorderStatusLabel(item, true)}</div>`
-      : "";
-
-    thumb.innerHTML = `
-      ${media}
-      <div class="thumb-meta">
-        <div class="thumb-name">${item.name}</div>
-        <div class="thumb-info">${detail}</div>
-        <div class="thumb-footer"><span class="thumb-ratio">${ratio}</span>${detection}</div>
-      </div>
-      <span class="thumb-delete" data-delete="true">×</span>
-    `;
-
-    thumb.addEventListener("click", (event) => {
-      const target = event.target as HTMLElement;
-      if (target.dataset.delete === "true") {
+    const thumb = createQueueThumbnail(
+      {
+        active: index === context.currentIndex,
+        disabled: isOperationBusy(),
+        previewSrc: item.thumbnailSrc || item.previewSrc,
+        fallbackLabel: state.mode === "image" ? "IMG" : "VID",
+        name: item.materialName.trim() || "未命名素材",
+        detail,
+        ratio,
+        detectionLabel: state.mode === "video" ? itemBlackBorderStatusLabel(item, true) : undefined,
+        detectionStatus: state.mode === "video" ? item.blackBorderDetection.status : undefined,
+      },
+      () => {
+        selectItem(index);
+        renderCurrentContext();
+      },
+      () => {
         removeItem(index);
         renderCurrentContext();
-        return;
-      }
-      selectItem(index);
-      renderCurrentContext();
-    });
+      },
+    );
 
     thumbsEl.appendChild(thumb);
   });
@@ -995,6 +930,7 @@ function renderThumbs() {
   if (listCountEl) {
     listCountEl.textContent = `${listLabel()} ${context.items.length}`;
   }
+  updateModeUi();
 }
 
 function ratioValue(mode = state.mode, ratio = currentItem(mode)?.settings.ratio ?? "9:16") {
@@ -1055,13 +991,12 @@ function positionRectByAnchor(mode = state.mode) {
   Object.assign(rect, positionRectInBounds(rect, bounds, anchor));
 }
 
-function ensureRect(mode = state.mode) {
-  const item = currentItem(mode);
+function ensureRect(mode = state.mode, item: QueueItem | null = currentItem(mode)) {
   if (!item?.lastProbe) {
     return;
   }
-  const bounds = getCropBounds(mode);
-  const ratio = ratioValue(mode);
+  const bounds = getItemCropBounds(item, mode);
+  const ratio = ratioValue(mode, item.settings.ratio);
 
   if (!item.settings.rect) {
     item.settings.rect = createRectForRatio(
@@ -1072,7 +1007,7 @@ function ensureRect(mode = state.mode) {
     );
   }
 
-  clampRect(mode);
+  item.settings.rect = clampRectToBounds(item.settings.rect, bounds);
 }
 
 function resizeRectByScale(mode = state.mode) {
@@ -1082,22 +1017,14 @@ function resizeRectByScale(mode = state.mode) {
   }
   const ratio = ratioValue(mode);
   const rect = item.settings.rect;
-  if (!rect || ratio === null) {
+  if (!rect) {
     return;
   }
   const bounds = getCropBounds(mode);
-  const fitted = maxFit(bounds.width, bounds.height, ratio);
-  const centerX = rect.x + rect.width / 2;
-  const centerY = rect.y + rect.height / 2;
-  rect.width = fitted.width * item.settings.scale;
-  rect.height = fitted.height * item.settings.scale;
-  rect.x = centerX - rect.width / 2;
-  rect.y = centerY - rect.height / 2;
-  Object.assign(rect, clampRectToBounds(rect, bounds));
+  item.settings.rect = resizeRectAroundCenter(rect, bounds, item.settings.scale, ratio);
 }
 
-function clampVideoSettings(mode = state.mode) {
-  const item = currentItem(mode);
+function clampVideoSettings(mode = state.mode, item: QueueItem | null = currentItem(mode)) {
   const duration = item?.lastProbe?.duration_seconds ?? 0;
   if (duration > 0) {
     if (!item) {
@@ -1162,7 +1089,7 @@ function updatePreviewVisibility() {
   previewEmptyEl?.classList.toggle("hide", hasPreview);
   if (dropTitleEl) {
     if (!item) {
-      dropTitleEl.textContent = state.mode === "image" ? "拖入图片" : "拖入视频";
+      dropTitleEl.textContent = "拖入图片或视频";
     } else if (item.status === "loading") {
       dropTitleEl.textContent = "正在生成预览...";
     } else if (item.status === "error") {
@@ -1283,12 +1210,8 @@ function syncScaleFromRect() {
     return;
   }
   const ratio = ratioValue();
-  if (ratio === null) {
-    return;
-  }
   const bounds = getCropBounds();
-  const fitted = maxFit(bounds.width, bounds.height, ratio);
-  item.settings.scale = Math.max(0.1, Math.min(1, item.settings.rect.width / fitted.width));
+  item.settings.scale = scaleForRect(item.settings.rect, bounds, ratio);
   if (scaleInput) {
     scaleInput.value = String(Math.round(item.settings.scale * 100));
   }
@@ -1304,6 +1227,7 @@ function renderCurrentContext() {
   syncControlsFromState();
   syncBlackBorderDetectionUi();
   renderMediaSummary();
+  syncFileNamingUi();
   setProgress(context.progressPercent, context.progressText);
   renderThumbs();
   updatePreviewVisibility();
@@ -1432,7 +1356,7 @@ function setModeProgress(mode: MediaMode, percent: number, text: string) {
 }
 
 async function runBlackBorderDetection(items: QueueItem[], mode: MediaMode, automatic = false) {
-  if (mode !== "video" || items.length === 0 || isOperationBusy()) {
+  if (mode !== "video" || items.length === 0 || state.exportBusy || state.detectionBusy) {
     return;
   }
 
@@ -1473,17 +1397,16 @@ async function runBlackBorderDetection(items: QueueItem[], mode: MediaMode, auto
   }
 }
 
-async function autoProbeMedia(mode = state.mode) {
+async function autoProbeMedia(item: QueueItem, mode: MediaMode) {
   const context = currentContext(mode);
-  const item = currentItem(mode);
   if (!item?.inputPath) {
     return;
   }
 
-  context.loadToken += 1;
-  const loadToken = context.loadToken;
+  item.loadRevision += 1;
+  const loadRevision = item.loadRevision;
   context.log = "正在自动调用 ffprobe 读取媒体信息...";
-  if (mode === state.mode) {
+  if (mode === state.mode && currentItem(mode) === item) {
     setMediaSummary("正在自动读取媒体信息...");
     renderCurrentContext();
   }
@@ -1492,24 +1415,28 @@ async function autoProbeMedia(mode = state.mode) {
     const result = await invoke<ProbeResult>("probe_media", {
       inputPath: item.inputPath,
     });
-    if (context.loadToken !== loadToken) {
+    if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
       return;
     }
 
+    if (result.media_kind !== mode) {
+      throw new Error(`文件实际类型为${result.media_kind === "video" ? "视频" : "图片"}，与导入队列不一致`);
+    }
+
     item.lastProbe = result;
-    clampVideoSettings(mode);
+    clampVideoSettings(mode, item);
     item.settings.rect = null;
     context.log = "媒体信息读取成功，可以直接拖拽裁剪框或调整参数。";
-    ensureRect(mode);
+    ensureRect(mode, item);
     if (mode === "video") {
       const totalDuration = Math.max(MIN_VIDEO_SEGMENT_SECONDS, result.duration_seconds ?? item.settings.videoDurationSeconds);
       item.settings.videoStartSeconds = 0;
       item.settings.videoDurationSeconds = totalDuration;
       item.previewSeconds = 0;
-      clampVideoSettings(mode);
+      clampVideoSettings(mode, item);
       if (autoDetectBlackBordersEl?.checked ?? true) {
         await runBlackBorderDetection([item], mode, true);
-        if (context.loadToken !== loadToken) {
+        if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
           return;
         }
       }
@@ -1518,75 +1445,137 @@ async function autoProbeMedia(mode = state.mode) {
           const previewVideo = await invoke<PreviewVideoAssetResult>("build_preview_video_asset", {
             inputPath: item.inputPath,
           });
-          if (context.loadToken !== loadToken) {
+          if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
+            await releasePreviewAssetPath(previewVideo.filePath);
             return;
           }
+          await releasePreviewAsset(item);
+          item.previewAssetPath = previewVideo.filePath;
           item.nativeVideoSrc = convertFileSrc(previewVideo.filePath);
           item.previewSrc = "";
           item.status = "ready";
           item.errorMessage = "";
+          await requestThumbnailFrame(item, mode, item.previewSeconds);
         } catch (previewError) {
-          item.nativeVideoSrc = "";
+          await releasePreviewAsset(item);
           context.log = `代理视频预览生成失败，已回退静态预览：${String(previewError)}`;
-          await requestPreviewFrame(mode, item.previewSeconds);
+          await requestPreviewFrame(item, mode, item.previewSeconds);
         }
       } else {
-        await requestPreviewFrame(mode, item.previewSeconds);
+        await requestPreviewFrame(item, mode, item.previewSeconds);
       }
     } else {
       item.previewSeconds = 0;
-      await requestPreviewFrame(mode, item.previewSeconds);
+      await requestPreviewFrame(item, mode, item.previewSeconds);
     }
-    if (mode === state.mode) {
+    if (mode === state.mode && currentItem(mode) === item) {
       renderCurrentContext();
     }
   } catch (error) {
-    if (context.loadToken !== loadToken) {
+    if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
       return;
     }
     item.previewSrc = "";
     item.status = "error";
     item.errorMessage = String(error);
     context.log = `自动读取媒体信息失败：${String(error)}`;
-    if (mode === state.mode) {
+    if (mode === state.mode && currentItem(mode) === item) {
       renderCurrentContext();
       setMediaSummary("媒体信息读取失败");
     }
   }
 }
 
-async function loadInputFile(filePath: string) {
-  const context = currentContext();
-  const item = createQueueItem(state.mode, filePath);
-  context.items.push(item);
-  context.currentIndex = context.items.length - 1;
-  context.progressPercent = 0;
-  context.progressText = "等待导出...";
-  context.log = "正在准备素材...";
+function existingMediaPaths() {
+  return new Set(
+    (["image", "video"] as const).flatMap((mode) =>
+      currentContext(mode).items.map((item) => item.inputPath),
+    ),
+  );
+}
+
+async function importRoutedFiles(files: RoutedMediaFile[]) {
+  const queued = files.map(({ mode, path }) => {
+    const context = currentContext(mode);
+    const item = createQueueItem(mode, path);
+    context.items.push(item);
+    context.currentIndex = context.items.length - 1;
+    context.progressPercent = 0;
+    context.progressText = "等待导出...";
+    context.log = "正在准备素材...";
+    return { mode, item };
+  });
+
   renderCurrentContext();
-  await autoProbeMedia();
+  for (const { mode, item } of queued) {
+    await autoProbeMedia(item, mode);
+  }
+
+  const imageCount = queued.filter(({ mode }) => mode === "image").length;
+  const videoCount = queued.length - imageCount;
+  const summaryParts = [
+    imageCount > 0 ? `${imageCount} 张图片` : "",
+    videoCount > 0 ? `${videoCount} 个视频` : "",
+  ].filter(Boolean);
+  const summary = `导入完成：${summaryParts.join("、")}`;
+  if (imageCount > 0) currentContext("image").log = summary;
+  if (videoCount > 0) currentContext("video").log = summary;
+}
+
+async function runImport(files: RoutedMediaFile[]) {
+  if (files.length === 0 || isOperationBusy()) {
+    return false;
+  }
+
+  state.importBusy = true;
+  setButtonsDisabledState();
+  try {
+    await importRoutedFiles(files);
+    return true;
+  } finally {
+    state.importBusy = false;
+    renderCurrentContext();
+  }
 }
 
 async function pickInputFile() {
-  const selected = await open({
-    multiple: true,
-    directory: false,
-    filters: [
-      {
-        name: state.mode === "image" ? "Image" : "Video",
-        extensions: getMediaExtensions(state.mode),
-      },
-    ],
-  });
-
-  if (!selected) {
-    setLog("已取消文件选择。");
+  if (isOperationBusy()) {
     return;
   }
 
-  const paths = Array.isArray(selected) ? selected : [selected];
-  for (const filePath of paths) {
-    await loadInputFile(filePath);
+  const mode = state.mode;
+  state.importBusy = true;
+  setButtonsDisabledState();
+  try {
+    const selected = await open({
+      multiple: true,
+      directory: false,
+      filters: [
+        {
+          name: mode === "image" ? "Image" : "Video",
+          extensions: [...MEDIA_EXTENSIONS[mode]],
+        },
+      ],
+    });
+
+    if (!selected) {
+      currentContext(mode).log = "已取消文件选择。";
+      return;
+    }
+
+    const paths = Array.isArray(selected) ? selected : [selected];
+    const existing = existingMediaPaths();
+    const files = paths
+      .filter((path) => !existing.has(path))
+      .map((path) => ({ mode, path }));
+    if (files.length === 0) {
+      currentContext(mode).log = "所选素材已经在队列中。";
+      return;
+    }
+    await importRoutedFiles(files);
+  } finally {
+    state.importBusy = false;
+    renderCurrentContext();
   }
 }
 
@@ -1598,7 +1587,7 @@ async function exportSampleCrop() {
   }
 
   if (!item.lastProbe) {
-    await autoProbeMedia();
+    await autoProbeMedia(item, state.mode);
     if (!currentItem()?.lastProbe) {
       return;
     }
@@ -1606,7 +1595,13 @@ async function exportSampleCrop() {
 
   const isImage = state.mode === "image";
   const outputExtension = isImage ? getImageFormatExtension() : "mp4";
-  const suggestedName = `${getFileStem(item.inputPath)}_${getSelectedRatio().replace(":", "x")}.${outputExtension}`;
+  const suggestedName = buildExportFileName(currentContext().items, item.id, outputExtension);
+  if (!suggestedName) {
+    setLog("请先为当前素材填写有效的素材名称。");
+    materialNameInput?.focus();
+    materialNameInput?.select();
+    return;
+  }
   const outputPath = await save({
     title: isImage ? "保存导出图片" : "保存导出视频",
     defaultPath: suggestedName,
@@ -1674,6 +1669,16 @@ async function exportBatch() {
     return;
   }
 
+  const invalidNameIndex = items.findIndex((item) => !sanitizeMaterialName(item.materialName));
+  if (invalidNameIndex >= 0) {
+    context.currentIndex = invalidNameIndex;
+    renderCurrentContext();
+    setLog("批量导出前，请先为所有素材填写有效的素材名称。");
+    materialNameInput?.focus();
+    materialNameInput?.select();
+    return;
+  }
+
   const outputDir = await open({
     directory: true,
     title: "选择批量导出目录",
@@ -1685,6 +1690,7 @@ async function exportBatch() {
 
   const isImage = state.mode === "image";
   const outputExtension = isImage ? "png" : "mp4";
+  const exportBaseNames = buildExportBaseNames(items);
 
   state.exportBusy = true;
   state.exportingMode = state.mode;
@@ -1703,9 +1709,14 @@ async function exportBatch() {
     const item = items[i];
     batchState.currentItemIndex = i;
 
-    const stem = getFileStem(item.inputPath);
-    const ratioSuffix = item.settings.ratio.replace(":", "x");
-    const outputPath = `${outputDir}/${stem}_${ratioSuffix}.${outputExtension}`;
+    const exportBaseName = exportBaseNames.get(item.id);
+    if (!exportBaseName) {
+      failedCount += 1;
+      logLines.push(`[${i + 1}/${items.length}] ${item.name} 导出失败：素材名称无效`);
+      batchState.completedItems = i + 1;
+      continue;
+    }
+    const outputPath = `${outputDir}/${exportBaseName}.${outputExtension}`;
 
     const request: ExportRequest = {
       inputPath: item.inputPath,
@@ -1752,152 +1763,6 @@ async function exportBatch() {
   setLog([summary, "", ...logLines].join("\n"));
   setProgress(100, summary);
   renderCurrentContext();
-}
-
-function bindCropDragging() {
-  let mode: HandleMode | null = null;
-  let startRect: CropRect | null = null;
-  let startX = 0;
-  let startY = 0;
-
-  function mediaScale() {
-    const mediaEl = currentMediaEl();
-    const sourceWidth = getSourceWidth();
-    return mediaEl && sourceWidth ? mediaEl.clientWidth / sourceWidth : 1;
-  }
-
-  cropBoxEl?.addEventListener("mousedown", (event) => {
-    const item = currentItem();
-    if (!item?.lastProbe || !item.settings.rect || isOperationBusy()) {
-      return;
-    }
-    const target = event.target as HTMLElement;
-    mode = (target.dataset.handle as HandleMode | undefined) ?? "move";
-    startRect = { ...item.settings.rect };
-    startX = event.clientX;
-    startY = event.clientY;
-    event.preventDefault();
-    event.stopPropagation();
-  });
-
-  window.addEventListener("mousemove", (event) => {
-    const item = currentItem();
-    if (!mode || !startRect || !item?.lastProbe || !item.settings.rect) {
-      return;
-    }
-
-    markCropManuallyAdjusted(item);
-
-    const scale = mediaScale();
-    const dx = (event.clientX - startX) / scale;
-    const dy = (event.clientY - startY) / scale;
-    const ratio = ratioValue();
-    const bounds = getCropBounds();
-    const boundsRight = bounds.x + bounds.width;
-    const boundsBottom = bounds.y + bounds.height;
-
-    if (mode === "move") {
-      item.settings.rect.x = Math.max(
-        bounds.x,
-        Math.min(boundsRight - startRect.width, startRect.x + dx),
-      );
-      item.settings.rect.y = Math.max(
-        bounds.y,
-        Math.min(boundsBottom - startRect.height, startRect.y + dy),
-      );
-    } else if (ratio === null) {
-      let x1 = startRect.x;
-      let y1 = startRect.y;
-      let x2 = startRect.x + startRect.width;
-      let y2 = startRect.y + startRect.height;
-
-      if (mode === "nw") {
-        x1 += dx;
-        y1 += dy;
-      } else if (mode === "ne") {
-        x2 += dx;
-        y1 += dy;
-      } else if (mode === "sw") {
-        x1 += dx;
-        y2 += dy;
-      } else if (mode === "se") {
-        x2 += dx;
-        y2 += dy;
-      }
-
-      x1 = Math.max(bounds.x, Math.min(x1, x2 - 20));
-      y1 = Math.max(bounds.y, Math.min(y1, y2 - 20));
-      x2 = Math.min(boundsRight, Math.max(x2, x1 + 20));
-      y2 = Math.min(boundsBottom, Math.max(y2, y1 + 20));
-      item.settings.rect = {
-        x: x1,
-        y: y1,
-        width: x2 - x1,
-        height: y2 - y1,
-      };
-    } else {
-      let nextWidth = startRect.width;
-      let nextX = startRect.x;
-      let nextY = startRect.y;
-
-      if (mode === "se" || mode === "ne") {
-        nextWidth = startRect.width + dx;
-      } else if (mode === "sw" || mode === "nw") {
-        nextWidth = startRect.width - dx;
-      }
-
-      nextWidth = Math.max(20, nextWidth);
-      let nextHeight = nextWidth / ratio;
-
-      if (mode === "se") {
-        nextX = startRect.x;
-        nextY = startRect.y;
-      } else if (mode === "ne") {
-        nextX = startRect.x;
-        nextY = startRect.y + startRect.height - nextHeight;
-      } else if (mode === "sw") {
-        nextX = startRect.x + startRect.width - nextWidth;
-        nextY = startRect.y;
-      } else if (mode === "nw") {
-        nextX = startRect.x + startRect.width - nextWidth;
-        nextY = startRect.y + startRect.height - nextHeight;
-      }
-
-      if (nextX < bounds.x) {
-        const overflow = bounds.x - nextX;
-        nextWidth -= overflow;
-        nextHeight = nextWidth / ratio;
-        nextX = bounds.x;
-      }
-      if (nextY < bounds.y) {
-        nextY = bounds.y;
-      }
-      if (nextX + nextWidth > boundsRight) {
-        nextWidth = boundsRight - nextX;
-        nextHeight = nextWidth / ratio;
-      }
-      if (nextY + nextHeight > boundsBottom) {
-        nextHeight = boundsBottom - nextY;
-        nextWidth = nextHeight * ratio;
-      }
-
-      item.settings.rect = {
-        x: nextX,
-        y: nextY,
-        width: nextWidth,
-        height: nextWidth / ratio,
-      };
-      clampRect();
-      syncScaleFromRect();
-    }
-
-    drawCropBox();
-  });
-
-  window.addEventListener("mouseup", () => {
-    mode = null;
-    startRect = null;
-  });
 }
 
 async function bindExportProgressEvents() {
@@ -1985,18 +1850,96 @@ async function bindExportProgressEvents() {
   });
 }
 
+async function handleDroppedPaths(paths: string[]) {
+  if (isOperationBusy()) {
+    setLog("当前正在执行其他操作，请完成后再拖入素材。");
+    return;
+  }
+
+  const routed = routeMediaPaths(paths, existingMediaPaths());
+  if (routed.accepted.length === 0) {
+    const reasons = [];
+    if (routed.unsupported.length > 0) reasons.push(`${routed.unsupported.length} 个不支持的文件`);
+    if (routed.duplicates.length > 0) reasons.push(`${routed.duplicates.length} 个重复文件`);
+    setLog(reasons.length > 0 ? `没有可导入的素材：${reasons.join("、")}。` : "没有检测到可导入的文件。");
+    return;
+  }
+
+  const imported = await runImport(routed.accepted);
+  if (!imported) {
+    return;
+  }
+
+  const notes = [];
+  if (routed.unsupported.length > 0) notes.push(`已忽略 ${routed.unsupported.length} 个不支持的文件`);
+  if (routed.duplicates.length > 0) notes.push(`已忽略 ${routed.duplicates.length} 个重复文件`);
+  if (notes.length > 0) {
+    const context = currentContext();
+    context.log = `${context.log}\n${notes.join("；")}。`;
+    renderCurrentContext();
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   const savedAutoDetection = localStorage.getItem("media-cropper-auto-detect-black-borders");
   if (autoDetectBlackBordersEl && savedAutoDetection !== null) {
     autoDetectBlackBordersEl.checked = savedAutoDetection === "true";
   }
   void bindExportProgressEvents();
-  bindCropDragging();
+  void bindFileDropEvents(previewStageEl, handleDroppedPaths).catch((error) => {
+    setLog(`文件拖拽监听初始化失败：${String(error)}`);
+  });
+  bindCropDragging({
+    cropBoxEl,
+    currentMediaEl,
+    getSourceWidth,
+    currentItem,
+    isBusy: isOperationBusy,
+    markAdjusted: markCropManuallyAdjusted,
+    ratioValue,
+    getBounds: getCropBounds,
+    clampRect,
+    syncScaleFromRect,
+    drawCropBox,
+  });
   updateModeUi();
   syncControlsFromState();
   setButtonsDisabledState();
   clearPreviewDom();
   renderCurrentContext();
+
+  materialNameInput?.addEventListener("focus", () => {
+    materialNameInput.select();
+  });
+  materialNameInput?.addEventListener("input", () => {
+    const item = currentItem();
+    if (!item) {
+      return;
+    }
+    item.materialName = materialNameInput.value;
+    renderThumbs();
+    syncFileNamingUi();
+    setButtonsDisabledState();
+  });
+  materialNameInput?.addEventListener("change", () => {
+    const item = currentItem();
+    if (!item) {
+      return;
+    }
+    item.materialName = sanitizeMaterialName(materialNameInput.value);
+    materialNameInput.value = item.materialName;
+    renderThumbs();
+    syncFileNamingUi();
+    setButtonsDisabledState();
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key !== "F2" || !currentItem() || isOperationBusy()) {
+      return;
+    }
+    event.preventDefault();
+    materialNameInput?.focus();
+    materialNameInput?.select();
+  });
 
   modeTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -2113,14 +2056,12 @@ window.addEventListener("DOMContentLoaded", () => {
     markCropManuallyAdjusted(item);
     item.settings.scale = getSelectedScale();
     updateScaleLabel();
-    if (ratioValue() !== null) {
-      if (!item.settings.rect) {
-        ensureRect();
-      } else {
-        resizeRectByScale();
-      }
-      drawCropBox();
+    if (!item.settings.rect) {
+      ensureRect();
+    } else {
+      resizeRectByScale();
     }
+    drawCropBox();
     renderThumbs();
   });
 
@@ -2154,7 +2095,7 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
     cancelScheduledVideoPreview();
-    void requestPreviewFrame("video", item.previewSeconds);
+    void requestPreviewFrame(item, "video", item.previewSeconds);
   });
   videoPreviewToggleEl?.addEventListener("click", () => {
     const item = currentItem();
@@ -2220,7 +2161,7 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
     cancelScheduledVideoPreview();
-    void requestPreviewFrame("video", item.previewSeconds);
+    void requestPreviewFrame(item, "video", item.previewSeconds);
   });
   videoExportEndEl?.addEventListener("change", () => {
     const item = currentItem();
@@ -2232,7 +2173,7 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
     cancelScheduledVideoPreview();
-    void requestPreviewFrame("video", item.previewSeconds);
+    void requestPreviewFrame(item, "video", item.previewSeconds);
   });
   previewVideoEl?.addEventListener("loadedmetadata", () => {
     const item = currentItem();
@@ -2270,10 +2211,10 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item || !item.nativeVideoSrc || state.mode !== "video") {
       return;
     }
-    item.nativeVideoSrc = "";
+    void releasePreviewAsset(item);
     item.previewSeconds = item.settings.videoStartSeconds;
     setLog("当前视频无法在预览区原生播放，已回退为静态帧预览。");
-    void requestPreviewFrame("video", item.previewSeconds);
+    void requestPreviewFrame(item, "video", item.previewSeconds);
   });
   applyCurrentToAllButton?.addEventListener("click", () => {
     const context = currentContext();
@@ -2358,7 +2299,9 @@ window.addEventListener("DOMContentLoaded", () => {
     if (isOperationBusy()) {
       return;
     }
+    const items = context.items;
     context.items = [];
+    items.forEach((item) => void releasePreviewAsset(item));
     context.currentIndex = -1;
     context.log = "等待操作...";
     context.progressPercent = 0;

@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-FFMPEG_VERSION="8.1.1"
-FFMPEG_SHA256="b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3"
+FFMPEG_VERSION="8.1.2"
+FFMPEG_SHA256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 DEPLOYMENT_TARGET="11.0"
 TARGET_TRIPLE="aarch64-apple-darwin"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -156,7 +156,7 @@ for component in bbox crop format metadata scale; do
   require_listing_entry "$FILTERS" "$component"
 done
 if grep -Eq '[[:space:]]cropdetect[[:space:]]' <<<"$FILTERS"; then
-  echo "cropdetect is GPL in FFmpeg 8.1.1 and must not be present in this LGPL build." >&2
+  echo "cropdetect is GPL in FFmpeg ${FFMPEG_VERSION} and must not be present in this LGPL build." >&2
   exit 1
 fi
 

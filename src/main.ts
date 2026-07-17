@@ -743,12 +743,31 @@ function scheduleVideoPreviewRefresh(delay = 140) {
   }, delay);
 }
 
-async function releasePreviewAssetPath(filePath: string) {
+function mediaTaskIds(item: QueueItem) {
+  return [
+    `probe:${item.id}`,
+    `preview-frame:${item.id}`,
+    `thumbnail:${item.id}`,
+    `preview-video:${item.id}`,
+    `detect:${item.id}`,
+    `export:${item.id}`,
+  ];
+}
+
+async function cancelItemMediaTasks(item: QueueItem) {
+  try {
+    await invoke("cancel_media_tasks", { taskIds: mediaTaskIds(item) });
+  } catch (error) {
+    console.warn("Failed to cancel media tasks", error);
+  }
+}
+
+async function releasePreviewAssetPath(filePath: string, temporary: boolean) {
   if (!filePath) {
     return;
   }
   try {
-    await invoke("delete_preview_asset", { filePath });
+    await invoke("delete_preview_asset", { filePath, temporary });
   } catch (error) {
     console.warn("Failed to release preview asset", error);
   }
@@ -756,10 +775,12 @@ async function releasePreviewAssetPath(filePath: string) {
 
 async function releasePreviewAsset(item: QueueItem) {
   const filePath = item.previewAssetPath;
+  const temporary = item.previewAssetTemporary;
   item.previewAssetPath = "";
+  item.previewAssetTemporary = false;
   item.nativeVideoSrc = "";
   if (filePath) {
-    await releasePreviewAssetPath(filePath);
+    await releasePreviewAssetPath(filePath, temporary);
   }
 }
 
@@ -803,6 +824,7 @@ async function requestPreviewFrame(item: QueueItem, mode: MediaMode, previewSeco
     const preview = await invoke<PreviewDataUrlResult>("build_preview_data_url", {
       inputPath: item.inputPath,
       previewTimeSeconds: mode === "video" ? item.previewSeconds : undefined,
+      taskId: `preview-frame:${item.id}`,
     });
     if (
       requestId !== item.previewRevision ||
@@ -852,6 +874,7 @@ async function requestThumbnailFrame(
     const preview = await invoke<PreviewDataUrlResult>("build_preview_data_url", {
       inputPath: item.inputPath,
       previewTimeSeconds: mode === "video" ? Math.max(0, previewSeconds) : undefined,
+      taskId: `thumbnail:${item.id}`,
     });
     if (
       item.loadRevision !== loadRevision ||
@@ -886,6 +909,7 @@ function removeItem(index: number, mode = state.mode) {
   const context = currentContext(mode);
   const [removed] = context.items.splice(index, 1);
   if (removed) {
+    void cancelItemMediaTasks(removed);
     void releasePreviewAsset(removed);
   }
   if (context.currentIndex >= context.items.length) {
@@ -1310,6 +1334,7 @@ async function detectBlackBordersForItem(item: QueueItem, mode: MediaMode) {
   try {
     const result = await invoke<BlackBorderDetectionResult>("detect_black_borders", {
       request: {
+        taskId: `detect:${item.id}`,
         inputPath: item.inputPath,
         startSeconds,
         durationSeconds,
@@ -1426,6 +1451,7 @@ async function autoProbeMedia(item: QueueItem, mode: MediaMode) {
   try {
     const result = await invoke<ProbeResult>("probe_media", {
       inputPath: item.inputPath,
+      taskId: `probe:${item.id}`,
     });
     if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
       return;
@@ -1456,13 +1482,15 @@ async function autoProbeMedia(item: QueueItem, mode: MediaMode) {
         try {
           const previewVideo = await invoke<PreviewVideoAssetResult>("build_preview_video_asset", {
             inputPath: item.inputPath,
+            taskId: `preview-video:${item.id}`,
           });
           if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
-            await releasePreviewAssetPath(previewVideo.filePath);
+            await releasePreviewAssetPath(previewVideo.filePath, previewVideo.temporary);
             return;
           }
           await releasePreviewAsset(item);
           item.previewAssetPath = previewVideo.filePath;
+          item.previewAssetTemporary = previewVideo.temporary;
           item.nativeVideoSrc = convertFileSrc(previewVideo.filePath);
           item.previewSrc = "";
           item.status = "ready";
@@ -1631,6 +1659,7 @@ async function exportSampleCrop() {
   }
 
   const request: ExportRequest = {
+    taskId: `export:${item.id}`,
     inputPath: item.inputPath,
     outputPath,
     avoidOverwrite: false,
@@ -1701,7 +1730,6 @@ async function exportBatch() {
   }
 
   const isImage = state.mode === "image";
-  const outputExtension = isImage ? "png" : "mp4";
   const exportBaseNames = buildExportBaseNames(items);
 
   state.exportBusy = true;
@@ -1728,9 +1756,11 @@ async function exportBatch() {
       batchState.completedItems = i + 1;
       continue;
     }
+    const outputExtension = isImage ? item.settings.imageFormat : "mp4";
     const outputPath = `${outputDir}/${exportBaseName}.${outputExtension}`;
 
     const request: ExportRequest = {
+      taskId: `export:${item.id}`,
       inputPath: item.inputPath,
       outputPath,
       avoidOverwrite: true,
@@ -1746,8 +1776,8 @@ async function exportBatch() {
             height: Math.round(item.settings.rect.height),
           }
         : undefined,
-      imageFormat: isImage ? "png" : undefined,
-      imageQuality: isImage ? 100 : undefined,
+      imageFormat: isImage ? item.settings.imageFormat : undefined,
+      imageQuality: isImage ? item.settings.imageQuality : undefined,
       videoStartSeconds: isImage ? undefined : item.settings.videoStartSeconds,
       videoDurationSeconds: isImage ? undefined : item.settings.videoDurationSeconds,
     };
@@ -2328,7 +2358,10 @@ window.addEventListener("DOMContentLoaded", () => {
     }
     const items = context.items;
     context.items = [];
-    items.forEach((item) => void releasePreviewAsset(item));
+    items.forEach((item) => {
+      void cancelItemMediaTasks(item);
+      void releasePreviewAsset(item);
+    });
     context.currentIndex = -1;
     context.log = "等待操作...";
     context.progressPercent = 0;

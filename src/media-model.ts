@@ -28,6 +28,7 @@ export type PreviewDataUrlResult = {
 
 export type PreviewVideoAssetResult = {
   filePath: string;
+  temporary: boolean;
 };
 
 export type ExportProgressEvent = {
@@ -85,6 +86,7 @@ export type ItemSettings = {
 };
 
 export type ExportRequest = {
+  taskId?: string;
   inputPath: string;
   outputPath: string;
   avoidOverwrite?: boolean;
@@ -109,6 +111,7 @@ export type QueueItem = {
   thumbnailSrc: string;
   nativeVideoSrc: string;
   previewAssetPath: string;
+  previewAssetTemporary: boolean;
   previewSeconds: number;
   previewRevision: number;
   loadRevision: number;
@@ -193,6 +196,7 @@ export function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
     thumbnailSrc: "",
     nativeVideoSrc: "",
     previewAssetPath: "",
+    previewAssetTemporary: false,
     previewSeconds: 0,
     previewRevision: 0,
     loadRevision: 0,

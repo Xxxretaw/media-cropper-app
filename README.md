@@ -4,6 +4,8 @@
 
 当前版本：`0.4.1`
 
+面向使用者的历次变化见 [`USER_FACING_CHANGELOG.md`](USER_FACING_CHANGELOG.md)；开发与安全层面的完整记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 ## 当前能力
 
 - 图片和视频的自由裁切、固定比例裁切与批量导出。

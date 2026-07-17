@@ -45,7 +45,7 @@
             <div class="preview-viewport" id="preview-viewport">
               <div class="preview-empty" id="preview-empty">
                 <div class="drop-icon">+</div>
-                <div class="drop-title" id="drop-title">拖入图片</div>
+                <div class="drop-title" id="drop-title">拖入图片或视频</div>
                 <button id="pick-input-secondary" type="button" class="pick-button">选择图片</button>
               </div>
               <div class="media-wrap hide" id="media-wrap">
@@ -83,8 +83,17 @@
         </section>
 
         <aside class="panel inspector-panel" id="panel-shell">
-          <section class="inspector-section">
-            <h2>目标画幅</h2>
+          <div class="inspector-empty">
+            <div class="inspector-empty-icon">↗</div>
+            <strong>选择一个素材</strong>
+            <span>设置裁切、文件名称和导出选项</span>
+          </div>
+
+          <section class="inspector-section crop-settings-section">
+            <div class="panel-head crop-section-head">
+              <h2>裁切设置</h2>
+              <button id="apply-current-to-all" type="button" class="ghost-button section-action" disabled>应用到全部</button>
+            </div>
             <div class="ratios-panel" id="ratio-buttons">
               <button class="ratio-pill" data-ratio="21:9" type="button">21:9</button>
               <button class="ratio-pill" data-ratio="16:9" type="button">16:9</button>
@@ -95,12 +104,43 @@
               <button class="ratio-pill" data-ratio="free" type="button">自由</button>
             </div>
 
-            <div class="custom-ratio-row">
-              <input id="custom-ratio-width" type="number" min="1" step="1" placeholder="宽" />
-              <span class="ratio-separator">:</span>
-              <input id="custom-ratio-height" type="number" min="1" step="1" placeholder="高" />
-              <button id="apply-custom-ratio" type="button" class="ghost-button">应用自定义</button>
-            </div>
+            <label class="field field-range compact-range-field">
+              <span class="label">缩放</span>
+              <div class="range-row">
+                <input id="scale" type="range" min="10" max="100" step="1" value="100" />
+                <span class="value-chip" id="scale-value">100%</span>
+              </div>
+            </label>
+
+            <details class="advanced-details">
+              <summary>高级设置</summary>
+              <div class="advanced-content">
+                <div class="advanced-block">
+                  <span class="label">自定义比例</span>
+                  <div class="custom-ratio-row">
+                    <input id="custom-ratio-width" type="number" min="1" step="1" placeholder="宽" />
+                    <span class="ratio-separator">:</span>
+                    <input id="custom-ratio-height" type="number" min="1" step="1" placeholder="高" />
+                    <button id="apply-custom-ratio" type="button" class="ghost-button">应用</button>
+                  </div>
+                </div>
+
+                <div class="advanced-block">
+                  <span class="label">对齐方式</span>
+                  <div class="anchor-grid" id="anchor-buttons">
+                    <button class="anchor-btn" data-anchor="lt" type="button">↖</button>
+                    <button class="anchor-btn" data-anchor="top" type="button">↑</button>
+                    <button class="anchor-btn" data-anchor="rt" type="button">↗</button>
+                    <button class="anchor-btn" data-anchor="left" type="button">←</button>
+                    <button class="anchor-btn active" data-anchor="center" type="button">●</button>
+                    <button class="anchor-btn" data-anchor="right" type="button">→</button>
+                    <button class="anchor-btn" data-anchor="lb" type="button">↙</button>
+                    <button class="anchor-btn" data-anchor="bottom" type="button">↓</button>
+                    <button class="anchor-btn" data-anchor="rb" type="button">↘</button>
+                  </div>
+                </div>
+              </div>
+            </details>
 
             <select id="ratio" class="native-hidden">
               <option value="21:9">21:9</option>
@@ -112,32 +152,6 @@
               <option value="free">自由</option>
               <option id="custom-ratio-option" value="custom" hidden>custom</option>
             </select>
-          </section>
-
-          <section class="inspector-section">
-            <h2>大小</h2>
-            <label class="field field-range">
-              <span class="label">缩放</span>
-              <div class="range-row">
-                <input id="scale" type="range" min="10" max="100" step="1" value="100" />
-                <span class="value-chip" id="scale-value">100%</span>
-              </div>
-            </label>
-          </section>
-
-          <section class="inspector-section">
-            <h2>对齐</h2>
-            <div class="anchor-grid" id="anchor-buttons">
-              <button class="anchor-btn" data-anchor="lt" type="button">↖</button>
-              <button class="anchor-btn" data-anchor="top" type="button">↑</button>
-              <button class="anchor-btn" data-anchor="rt" type="button">↗</button>
-              <button class="anchor-btn" data-anchor="left" type="button">←</button>
-              <button class="anchor-btn active" data-anchor="center" type="button">●</button>
-              <button class="anchor-btn" data-anchor="right" type="button">→</button>
-              <button class="anchor-btn" data-anchor="lb" type="button">↙</button>
-              <button class="anchor-btn" data-anchor="bottom" type="button">↓</button>
-              <button class="anchor-btn" data-anchor="rb" type="button">↘</button>
-            </div>
 
             <select id="anchor" class="native-hidden">
               <option value="lt">左上</option>
@@ -152,47 +166,68 @@
             </select>
           </section>
 
-          <section class="inspector-section" id="image-settings">
-            <h2>导出</h2>
-            <div class="settings-grid">
-              <div class="field">
-                <span class="label">图片格式</span>
-                <div class="static-value">PNG</div>
-                <select id="image-format" class="native-hidden">
-                  <option value="png" selected>PNG</option>
-                </select>
-              </div>
+          <section class="inspector-section naming-section">
+            <h2>文件命名</h2>
+            <label class="field" for="material-name-input">
+              <span class="label">素材名称</span>
+              <input
+                id="material-name-input"
+                type="text"
+                maxlength="120"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="请输入素材名称"
+              />
+            </label>
+            <div class="naming-reference compact-naming-preview">
+              <span class="label">导出预览</span>
+              <span class="naming-value export-name-preview" id="export-name-preview">—</span>
             </div>
+            <details class="source-name-details">
+              <summary>查看原始文件名</summary>
+              <span class="naming-value" id="original-file-name">—</span>
+            </details>
+            <div class="naming-message" id="naming-message">原始文件不会被修改 · F2 快速编辑</div>
           </section>
 
-          <section class="inspector-section hide" id="video-settings">
-            <h2>黑边检测</h2>
-            <div class="black-border-controls">
-              <label class="toggle-row" for="auto-detect-black-borders">
-                <input id="auto-detect-black-borders" type="checkbox" checked />
-                <span>导入后自动检测</span>
-              </label>
-              <div class="detection-actions">
-                <button id="detect-black-borders-current" type="button" class="ghost-button" disabled>检测当前</button>
-                <button id="detect-black-borders-all" type="button" class="ghost-button" disabled>检测全部</button>
-              </div>
-              <div class="detection-status-row">
+          <div class="native-hidden" id="image-settings">
+            <select id="image-format">
+              <option value="png" selected>PNG</option>
+            </select>
+          </div>
+
+          <details class="inspector-section advanced-section hide" id="video-settings">
+            <summary class="advanced-summary">
+              <span>视频优化</span>
+              <span class="summary-status-group">
                 <span id="black-border-status" data-status="not_run">尚未检测</span>
                 <span id="black-border-confidence"></span>
+              </span>
+            </summary>
+            <div class="advanced-section-body">
+              <div class="black-border-controls">
+                <label class="toggle-row" for="auto-detect-black-borders">
+                  <input id="auto-detect-black-borders" type="checkbox" checked />
+                  <span>导入后自动检测黑边</span>
+                </label>
+                <div class="detection-actions">
+                  <button id="detect-black-borders-current" type="button" class="ghost-button" disabled>检测当前</button>
+                  <button id="detect-black-borders-all" type="button" class="ghost-button" disabled>检测全部</button>
+                </div>
+                <div class="detection-detail" id="black-border-detail">将从多个时间点采样并自动应用可靠结果。</div>
               </div>
-              <div class="detection-detail" id="black-border-detail">将从多个时间点采样并自动应用可靠结果。</div>
-            </div>
-            <div class="settings-grid">
-              <div class="field">
-                <span class="label">输出片段</span>
-                <div class="static-value" id="video-range-summary">请在中间时间轴选择</div>
+              <div class="settings-grid">
+                <div class="field">
+                  <span class="label">输出片段</span>
+                  <div class="static-value" id="video-range-summary">请在中间时间轴选择</div>
+                </div>
               </div>
             </div>
-          </section>
+          </details>
 
-          <section class="inspector-section">
+          <section class="inspector-section export-progress-section hide" id="export-progress-section">
             <div class="panel-head">
-              <h2>导出进度</h2>
+              <h2>处理进度</h2>
               <span id="progress-percent">0%</span>
             </div>
             <div class="progress-track">
@@ -201,19 +236,19 @@
             <div class="progress-text" id="progress-text">等待导出...</div>
           </section>
 
-          <section class="inspector-section workbench-section">
+          <section class="inspector-section compact-log-section">
             <details class="log-details">
               <summary>执行日志</summary>
               <pre id="log-output">等待操作...</pre>
             </details>
-            <div class="footer-actions">
-              <div class="footer-export-actions dual-actions">
-                <button id="batch-export-button" type="button" class="ghost-button" disabled>批量导出</button>
-                <button id="export-button" type="button" disabled>导出当前图片</button>
-              </div>
-              <button id="apply-current-to-all" type="button" class="ghost-button" disabled>应用到全部</button>
-            </div>
           </section>
+
+          <div class="sticky-export-bar">
+            <div class="footer-export-actions dual-actions">
+              <button id="batch-export-button" type="button" class="ghost-button" disabled>批量导出</button>
+              <button id="export-button" type="button" disabled>导出当前图片</button>
+            </div>
+          </div>
         </aside>
       </section>
     </main>

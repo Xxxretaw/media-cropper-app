@@ -6,8 +6,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Emitter;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{Emitter, Manager};
+
+static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +124,37 @@ struct CropRect {
 struct OutputTarget {
     path: PathBuf,
     remove_on_drop: bool,
+}
+
+struct TemporaryPath {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TemporaryPath {
+    fn new(prefix: &str, extension: &str) -> Self {
+        Self {
+            path: unique_temp_path(prefix, extension),
+            remove_on_drop: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(mut self) -> PathBuf {
+        self.remove_on_drop = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl OutputTarget {
@@ -462,8 +496,62 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    env::temp_dir().join(format!("media-cropper-{prefix}-{timestamp}.{extension}"))
+        .as_nanos();
+    let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    env::temp_dir().join(format!(
+        "media-cropper-{prefix}-{}-{timestamp}-{counter}.{extension}",
+        std::process::id()
+    ))
+}
+
+fn is_managed_preview_asset(path: &Path) -> bool {
+    let temp_dir = env::temp_dir();
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.parent() == Some(temp_dir.as_path())
+        && file_name.starts_with("media-cropper-preview-video-")
+        && path.extension().and_then(|extension| extension.to_str()) == Some("mp4")
+}
+
+fn cleanup_stale_preview_assets(max_age: Duration) {
+    let now = SystemTime::now();
+    let Ok(entries) = fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_managed_preview_asset(&path) {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if is_stale {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn cleanup_current_process_preview_assets() {
+    let prefix = format!("media-cropper-preview-video-{}-", std::process::id());
+    let Ok(entries) = fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let belongs_to_current_process = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if belongs_to_current_process && is_managed_preview_asset(&path) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn probe_result_from_raw(raw: Value) -> ProbeResult {
@@ -532,7 +620,8 @@ fn build_preview_data_url(
     input_path: String,
     preview_time_seconds: Option<f64>,
 ) -> Result<PreviewDataUrlResult, String> {
-    let preview_path = unique_temp_path("preview", "jpg");
+    let preview_file = TemporaryPath::new("preview", "jpg");
+    let preview_path = preview_file.path();
     let mut args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
@@ -565,8 +654,7 @@ fn build_preview_data_url(
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let bytes = fs::read(&preview_path).map_err(|error| format!("读取预览图失败: {error}"))?;
-    let _ = fs::remove_file(&preview_path);
+    let bytes = fs::read(preview_path).map_err(|error| format!("读取预览图失败: {error}"))?;
 
     Ok(PreviewDataUrlResult {
         data_url: format!(
@@ -576,9 +664,9 @@ fn build_preview_data_url(
     })
 }
 
-#[tauri::command(async)]
-fn build_preview_video_asset(input_path: String) -> Result<PreviewVideoAssetResult, String> {
-    let preview_path = unique_temp_path("preview-video", "mp4");
+fn generate_preview_video_asset(input_path: &str) -> Result<TemporaryPath, String> {
+    let preview_file = TemporaryPath::new("preview-video", "mp4");
+    let preview_path = preview_file.path();
     let scale_filter =
         "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))',setsar=1";
 
@@ -589,7 +677,7 @@ fn build_preview_video_asset(input_path: String) -> Result<PreviewVideoAssetResu
             "-loglevel",
             "error",
             "-i",
-            &input_path,
+            input_path,
             "-vf",
             scale_filter,
             "-an",
@@ -612,9 +700,42 @@ fn build_preview_video_asset(input_path: String) -> Result<PreviewVideoAssetResu
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
+    Ok(preview_file)
+}
+
+#[tauri::command(async)]
+fn build_preview_video_asset(
+    app: tauri::AppHandle,
+    input_path: String,
+) -> Result<PreviewVideoAssetResult, String> {
+    let preview_file = generate_preview_video_asset(&input_path)?;
+    let preview_path = preview_file.path();
+
+    app.asset_protocol_scope()
+        .allow_file(preview_path)
+        .map_err(|error| format!("授权代理视频访问失败: {error}"))?;
+    let preview_path = preview_file.persist();
+
     Ok(PreviewVideoAssetResult {
         file_path: preview_path.to_string_lossy().to_string(),
     })
+}
+
+#[tauri::command]
+fn delete_preview_asset(app: tauri::AppHandle, file_path: String) -> Result<(), String> {
+    let path = PathBuf::from(file_path);
+    if !is_managed_preview_asset(&path) {
+        return Err("拒绝删除不受本应用管理的文件".to_string());
+    }
+
+    app.asset_protocol_scope()
+        .forbid_file(&path)
+        .map_err(|error| format!("撤销代理视频访问失败: {error}"))?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除代理视频失败: {error}")),
+    }
 }
 
 fn crop_rect_to_request(rect: CropRect) -> CropRectRequest {
@@ -1341,25 +1462,35 @@ fn export_media_inner(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .setup(|_| {
+            cleanup_stale_preview_assets(Duration::from_secs(24 * 60 * 60));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             probe_media,
             build_preview_data_url,
             build_preview_video_asset,
+            delete_preview_asset,
             detect_black_borders,
             export_media
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            cleanup_current_process_preview_assets();
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_data_url, build_preview_video_asset, detect_black_borders,
-        detection_confidence, export_media_inner, find_ffmpeg, parse_bbox_metadata,
+        build_preview_data_url, detect_black_borders, detection_confidence, export_media_inner,
+        find_ffmpeg, generate_preview_video_asset, is_managed_preview_asset, parse_bbox_metadata,
         parse_rotation_degrees, probe_media, probe_result_from_raw, representative_rect_for_window,
         suffixed_output_path, CropRect, CropRectRequest, DetectBlackBordersRequest,
         ExportMediaRequest,
@@ -1618,14 +1749,28 @@ lavfi.bbox.h=164
         let input_path = unique_path("preview-video-input.mp4");
         create_sample_video(&input_path);
 
-        let result = build_preview_video_asset(input_path.to_string_lossy().to_string())
+        let preview_file = generate_preview_video_asset(input_path.to_string_lossy().as_ref())
             .expect("preview video generation should succeed for generated sample");
-
-        let preview_path = PathBuf::from(&result.file_path);
+        let preview_path = preview_file.path().to_path_buf();
         assert!(preview_path.exists(), "preview proxy video should exist");
 
         let _ = fs::remove_file(input_path);
-        let _ = fs::remove_file(preview_path);
+        drop(preview_file);
+        assert!(
+            !preview_path.exists(),
+            "temporary preview should be removed on drop"
+        );
+    }
+
+    #[test]
+    fn managed_preview_asset_guard_rejects_unrelated_paths() {
+        let managed = super::unique_temp_path("preview-video", "mp4");
+        let unrelated_name = env::temp_dir().join("unrelated-preview.mp4");
+        let outside_temp = PathBuf::from("/tmp/subdir/media-cropper-preview-video-1-2-3.mp4");
+
+        assert!(is_managed_preview_asset(&managed));
+        assert!(!is_managed_preview_asset(&unrelated_name));
+        assert!(!is_managed_preview_asset(&outside_temp));
     }
 
     #[test]

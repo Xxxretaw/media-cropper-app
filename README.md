@@ -2,7 +2,7 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
-当前版本：`0.3.0`
+当前版本：`0.4.0`
 
 ## 当前能力
 
@@ -14,6 +14,7 @@
 - 每个视频独立保存检测结果；稳定结果自动应用，动态画幅或低置信度结果提示人工确认。
 - 检测黑边后切换画幅比例、锚点或缩放时，始终在去黑边后的有效画面内继续裁切。
 - 识别视频旋转元数据，裁切框统一使用 FFmpeg 自动旋转后的显示坐标。
+- 启动后自动检查 GitHub Releases；发现新版本时可在 App 内完成下载、签名校验、安装和重启。
 
 ## 本地运行
 
@@ -62,6 +63,19 @@ npm run tauri -- build
 产物默认位于：
 
 - `src-tauri/target/release/bundle/macos/media-cropper.app`
-- `src-tauri/target/release/bundle/dmg/media-cropper_0.3.0_aarch64.dmg`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.4.0_aarch64.dmg`
 
-未配置 Apple 签名身份时生成的包只适合本机或内部测试。面向普通用户发布前，必须使用 `Developer ID Application` 证书签名，并完成 Apple notarization 与 stapling；否则从网络下载后会被 Gatekeeper 警告或拦截。
+当前发行包使用 ad-hoc 签名，不依赖 Apple Developer ID。首次从网络下载后，macOS 仍可能要求用户在“系统设置 → 隐私与安全性”中确认打开。
+
+## 自动更新发布
+
+更新签名私钥只保存在本机 `~/.tauri/media-cropper-updater.key` 和 GitHub Actions Secret `TAURI_SIGNING_PRIVATE_KEY` 中，不得提交到仓库。密钥密码保存在 macOS 钥匙串和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` Secret 中。
+
+发布新版本时同步更新版本号和更新记录，然后创建并推送版本标签：
+
+```bash
+git tag v0.4.1
+git push origin v0.4.1
+```
+
+GitHub Actions 会自动构建 Apple Silicon 的 DMG 和 Tauri 更新包，并将 `latest.json`、签名与产物发布到 GitHub Releases。已安装 `0.4.0` 或更高版本的用户会在下次启动时收到更新提示。

@@ -42,6 +42,7 @@ import {
 import { createQueueThumbnail } from "./queue-view";
 import { bindCropDragging } from "./crop-drag-controller";
 import { bindFileDropEvents } from "./file-drop";
+import { bindAppUpdater } from "./app-updater";
 
 const state = createAppState();
 const batchState = createBatchState();
@@ -106,6 +107,17 @@ const panelShellEl = document.querySelector<HTMLElement>("#panel-shell");
 const cropDimsEl = document.querySelector<HTMLElement>("#crop-dims");
 const themeToggleEl = document.querySelector<HTMLButtonElement>("#theme-toggle");
 const previewStageEl = document.querySelector<HTMLElement>("#preview-stage");
+const updateCheckButton = document.querySelector<HTMLButtonElement>("#update-check-button");
+const updateOverlayEl = document.querySelector<HTMLElement>("#update-overlay");
+const updateVersionEl = document.querySelector<HTMLElement>("#update-version");
+const updateNotesEl = document.querySelector<HTMLElement>("#update-notes");
+const updateStatusEl = document.querySelector<HTMLElement>("#update-status");
+const updateErrorEl = document.querySelector<HTMLElement>("#update-error");
+const updateProgressShellEl = document.querySelector<HTMLElement>("#update-progress-shell");
+const updateProgressFillEl = document.querySelector<HTMLElement>("#update-progress-fill");
+const updateProgressTextEl = document.querySelector<HTMLElement>("#update-progress-text");
+const updateLaterButton = document.querySelector<HTMLButtonElement>("#update-later-button");
+const updateInstallButton = document.querySelector<HTMLButtonElement>("#update-install-button");
 let videoPreviewTimer: number | null = null;
 let videoPlaybackTimer: number | null = null;
 let videoPreviewPlaying = false;
@@ -1901,6 +1913,21 @@ window.addEventListener("DOMContentLoaded", () => {
     clampRect,
     syncScaleFromRect,
     drawCropBox,
+  });
+  bindAppUpdater({
+    checkButton: updateCheckButton,
+    overlay: updateOverlayEl,
+    version: updateVersionEl,
+    notes: updateNotesEl,
+    status: updateStatusEl,
+    error: updateErrorEl,
+    progressShell: updateProgressShellEl,
+    progressFill: updateProgressFillEl,
+    progressText: updateProgressTextEl,
+    laterButton: updateLaterButton,
+    installButton: updateInstallButton,
+  }, {
+    canInstall: () => !isOperationBusy(),
   });
   updateModeUi();
   syncControlsFromState();

@@ -1464,6 +1464,8 @@ fn export_media_inner(
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|_| {
             cleanup_stale_preview_assets(Duration::from_secs(24 * 60 * 60));
             Ok(())

@@ -60,6 +60,21 @@ jobs:
           cargo install cargo-audit --locked --version 0.22.2
           cargo audit --file src-tauri/Cargo.lock
 
+      - name: Prepare user-facing release notes
+        id: release_notes
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${version}" >&2
+            exit 1
+          fi
+          node scripts/extract-release-notes.mjs "${version}" > release-notes.md
+          {
+            echo 'body<<__RELEASE_NOTES__'
+            cat release-notes.md
+            echo '__RELEASE_NOTES__'
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
@@ -69,7 +84,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: Media Cropper v__VERSION__
-          releaseBody: See CHANGELOG.md for the changes in this version.
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin --bundles app,dmg --ci

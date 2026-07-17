@@ -1,5 +1,6 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 
 type UpdaterElements = {
   checkButton: HTMLButtonElement | null;
@@ -174,6 +175,7 @@ export function bindAppUpdater(elements: UpdaterElements, options: UpdaterOption
     setProgress(null, "正在准备下载…");
 
     try {
+      await invoke("cancel_all_media_tasks");
       await pendingUpdate.downloadAndInstall((event) => {
         if (event.event === "Started") {
           contentLength = event.data.contentLength ?? 0;

@@ -1,20 +1,28 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
 static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PREVIEW_PROXY_BIT_RATE: u64 = 1_200_000;
+const MAX_PREVIEW_PROXY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PREVIEW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportMediaRequest {
+    task_id: Option<String>,
     input_path: String,
     output_path: String,
     #[serde(default)]
@@ -71,11 +79,13 @@ struct PreviewDataUrlResult {
 #[serde(rename_all = "camelCase")]
 struct PreviewVideoAssetResult {
     file_path: String,
+    temporary: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetectBlackBordersRequest {
+    task_id: Option<String>,
     input_path: String,
     start_seconds: Option<f64>,
     duration_seconds: Option<f64>,
@@ -123,9 +133,12 @@ struct CropRect {
 
 struct OutputTarget {
     path: PathBuf,
-    remove_on_drop: bool,
+    working_path: PathBuf,
+    reserved_path: bool,
+    committed: bool,
 }
 
+#[derive(Debug)]
 struct TemporaryPath {
     path: PathBuf,
     remove_on_drop: bool,
@@ -158,17 +171,125 @@ impl Drop for TemporaryPath {
 }
 
 impl OutputTarget {
-    fn commit(&mut self) {
-        self.remove_on_drop = false;
+    fn working_path(&self) -> &Path {
+        &self.working_path
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        fs::rename(&self.working_path, &self.path)
+            .map_err(|error| format!("提交导出文件失败: {error}"))?;
+        self.reserved_path = false;
+        self.committed = true;
+        Ok(())
     }
 }
 
 impl Drop for OutputTarget {
     fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
+        if !self.committed {
+            let _ = fs::remove_file(&self.working_path);
+            if self.reserved_path {
+                let _ = fs::remove_file(&self.path);
+            }
         }
     }
+}
+
+#[derive(Default)]
+struct MediaTaskManager {
+    processes: Mutex<HashMap<String, u32>>,
+}
+
+impl MediaTaskManager {
+    fn register(&self, task_id: &str, pid: u32) {
+        let previous = self
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.to_string(), pid);
+        if let Some(previous_pid) = previous {
+            terminate_process(previous_pid);
+        }
+    }
+
+    fn finish(&self, task_id: &str, pid: u32) {
+        let mut processes = self
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if processes.get(task_id) == Some(&pid) {
+            processes.remove(task_id);
+        }
+    }
+
+    fn cancel(&self, task_id: &str) {
+        let pid = self
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_id);
+        if let Some(pid) = pid {
+            terminate_process(pid);
+        }
+    }
+
+    fn cancel_all(&self) {
+        let pids = self
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, pid)| pid)
+            .collect::<Vec<_>>();
+        for pid in pids {
+            terminate_process(pid);
+        }
+    }
+}
+
+struct RegisteredProcess<'a> {
+    manager: Option<&'a MediaTaskManager>,
+    task_id: Option<&'a str>,
+    pid: u32,
+}
+
+impl Drop for RegisteredProcess<'_> {
+    fn drop(&mut self) {
+        if let (Some(manager), Some(task_id)) = (self.manager, self.task_id) {
+            manager.finish(task_id, self.pid);
+        }
+    }
+}
+
+fn terminate_process(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+fn run_command_output(
+    command: &mut Command,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    if let (Some(manager), Some(task_id)) = (manager, task_id) {
+        manager.register(task_id, pid);
+    }
+    let registration = RegisteredProcess {
+        manager,
+        task_id,
+        pid,
+    };
+    let result = child.wait_with_output();
+    drop(registration);
+    result
 }
 
 fn suffixed_output_path(path: &Path, suffix: u64) -> Result<PathBuf, String> {
@@ -186,6 +307,34 @@ fn suffixed_output_path(path: &Path, suffix: u64) -> Result<PathBuf, String> {
     Ok(path.with_file_name(file_name))
 }
 
+fn create_export_working_path(output_parent: &Path, final_path: &Path) -> Result<PathBuf, String> {
+    loop {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut file_name = format!(
+            ".media-cropper-export-{}-{timestamp}-{counter}",
+            std::process::id()
+        );
+        if let Some(extension) = final_path.extension().and_then(|value| value.to_str()) {
+            file_name.push('.');
+            file_name.push_str(extension);
+        }
+        let working_path = output_parent.join(file_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&working_path)
+        {
+            Ok(_) => return Ok(working_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("创建导出临时文件失败: {error}")),
+        }
+    }
+}
+
 fn prepare_output_target(path: &Path, avoid_overwrite: bool) -> Result<OutputTarget, String> {
     let output_parent = path
         .parent()
@@ -194,36 +343,46 @@ fn prepare_output_target(path: &Path, avoid_overwrite: bool) -> Result<OutputTar
 
     fs::create_dir_all(output_parent).map_err(|error| format!("创建输出目录失败: {error}"))?;
 
-    if !avoid_overwrite {
-        return Ok(OutputTarget {
-            path: path.to_path_buf(),
-            remove_on_drop: false,
-        });
-    }
-
     let mut candidate = path.to_path_buf();
-    let mut suffix = 2_u64;
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_) => {
-                return Ok(OutputTarget {
-                    path: candidate,
-                    remove_on_drop: true,
-                });
+    let mut reserved_path = false;
+    if avoid_overwrite {
+        let mut suffix = 2_u64;
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(_) => {
+                    reserved_path = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    candidate = suffixed_output_path(path, suffix)?;
+                    suffix = suffix
+                        .checked_add(1)
+                        .ok_or_else(|| "无法为导出文件生成唯一名称".to_string())?;
+                }
+                Err(error) => return Err(format!("预留输出文件失败: {error}")),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                candidate = suffixed_output_path(path, suffix)?;
-                suffix = suffix
-                    .checked_add(1)
-                    .ok_or_else(|| "无法为导出文件生成唯一名称".to_string())?;
-            }
-            Err(error) => return Err(format!("预留输出文件失败: {error}")),
         }
     }
+
+    let working_path = match create_export_working_path(output_parent, &candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            if reserved_path {
+                let _ = fs::remove_file(&candidate);
+            }
+            return Err(error);
+        }
+    };
+    Ok(OutputTarget {
+        path: candidate,
+        working_path,
+        reserved_path,
+        committed: false,
+    })
 }
 
 fn parse_number_string(value: Option<&Value>) -> Option<String> {
@@ -444,6 +603,16 @@ fn sidecar_dir() -> PathBuf {
 }
 
 fn find_ffmpeg() -> PathBuf {
+    #[cfg(test)]
+    {
+        let test_sidecar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(format!("ffmpeg-{}-apple-darwin", std::env::consts::ARCH));
+        if test_sidecar.exists() {
+            return test_sidecar;
+        }
+    }
+
     let dir = sidecar_dir();
     // bundled .app: plain name
     let bundled = dir.join("ffmpeg");
@@ -459,6 +628,16 @@ fn find_ffmpeg() -> PathBuf {
 }
 
 fn find_ffprobe() -> PathBuf {
+    #[cfg(test)]
+    {
+        let test_sidecar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(format!("ffprobe-{}-apple-darwin", std::env::consts::ARCH));
+        if test_sidecar.exists() {
+            return test_sidecar;
+        }
+    }
+
     let dir = sidecar_dir();
     let bundled = dir.join("ffprobe");
     if bundled.exists() {
@@ -590,10 +769,18 @@ fn probe_result_from_raw(raw: Value) -> ProbeResult {
     }
 }
 
-#[tauri::command(async)]
-fn probe_media(input_path: String) -> Result<ProbeResult, String> {
-    let output = Command::new(find_ffprobe())
-        .args([
+fn probe_media_inner(
+    input_path: String,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
+) -> Result<ProbeResult, String> {
+    let input = Path::new(&input_path);
+    if !input.is_file() {
+        return Err("输入媒体不存在或不是普通文件".to_string());
+    }
+
+    let output = run_command_output(
+        Command::new(find_ffprobe()).args([
             "-v",
             "error",
             "-print_format",
@@ -601,9 +788,11 @@ fn probe_media(input_path: String) -> Result<ProbeResult, String> {
             "-show_format",
             "-show_streams",
             &input_path,
-        ])
-        .output()
-        .map_err(|error| format!("ffprobe 启动失败: {error}"))?;
+        ]),
+        manager,
+        task_id,
+    )
+    .map_err(|error| format!("ffprobe 启动失败: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -616,9 +805,19 @@ fn probe_media(input_path: String) -> Result<ProbeResult, String> {
 }
 
 #[tauri::command(async)]
-fn build_preview_data_url(
+fn probe_media(
+    manager: tauri::State<'_, MediaTaskManager>,
+    input_path: String,
+    task_id: Option<String>,
+) -> Result<ProbeResult, String> {
+    probe_media_inner(input_path, Some(&manager), task_id.as_deref())
+}
+
+fn build_preview_data_url_inner(
     input_path: String,
     preview_time_seconds: Option<f64>,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
 ) -> Result<PreviewDataUrlResult, String> {
     let preview_file = TemporaryPath::new("preview", "jpg");
     let preview_path = preview_file.path();
@@ -640,14 +839,14 @@ fn build_preview_data_url(
         input_path.clone(),
         "-frames:v".to_string(),
         "1".to_string(),
+        "-vf".to_string(),
+        "scale='if(gte(iw,ih),min(1600,iw),-2)':'if(gte(iw,ih),-2,min(1600,ih))'".to_string(),
         "-q:v".to_string(),
-        "2".to_string(),
+        "4".to_string(),
         preview_path.to_string_lossy().to_string(),
     ]);
 
-    let output = Command::new(find_ffmpeg())
-        .args(&args)
-        .output()
+    let output = run_command_output(Command::new(find_ffmpeg()).args(&args), manager, task_id)
         .map_err(|error| format!("ffmpeg 预览图生成失败: {error}"))?;
 
     if !output.status.success() {
@@ -664,14 +863,68 @@ fn build_preview_data_url(
     })
 }
 
-fn generate_preview_video_asset(input_path: &str) -> Result<TemporaryPath, String> {
+#[tauri::command(async)]
+fn build_preview_data_url(
+    manager: tauri::State<'_, MediaTaskManager>,
+    input_path: String,
+    preview_time_seconds: Option<f64>,
+    task_id: Option<String>,
+) -> Result<PreviewDataUrlResult, String> {
+    build_preview_data_url_inner(
+        input_path,
+        preview_time_seconds,
+        Some(&manager),
+        task_id.as_deref(),
+    )
+}
+
+fn is_direct_preview_compatible(probe: &ProbeResult) -> bool {
+    probe.codec_name.as_deref() == Some("h264")
+        && probe
+            .format_name
+            .as_deref()
+            .is_some_and(|format| format.split(',').any(|part| part == "mov" || part == "mp4"))
+}
+
+fn managed_preview_cache_bytes() -> u64 {
+    fs::read_dir(env::temp_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            is_managed_preview_asset(&path)
+                .then(|| entry.metadata().ok().map(|metadata| metadata.len()))
+                .flatten()
+        })
+        .sum()
+}
+
+fn generate_preview_video_asset(
+    input_path: &str,
+    duration_seconds: Option<f64>,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
+) -> Result<TemporaryPath, String> {
+    let duration_seconds = duration_seconds
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "无法确定视频时长，已回退静态预览".to_string())?;
+    let estimated_bytes = (duration_seconds * PREVIEW_PROXY_BIT_RATE as f64 / 8.0 * 1.15) as u64;
+    if estimated_bytes > MAX_PREVIEW_PROXY_BYTES {
+        return Err("视频过长，代理文件预计超过 512 MB，已回退静态预览".to_string());
+    }
+    let cache_bytes = managed_preview_cache_bytes();
+    if cache_bytes.saturating_add(estimated_bytes) > MAX_PREVIEW_CACHE_BYTES {
+        return Err("代理视频缓存将超过 1 GB，已回退静态预览".to_string());
+    }
+
     let preview_file = TemporaryPath::new("preview-video", "mp4");
     let preview_path = preview_file.path();
     let scale_filter =
         "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))',setsar=1";
 
-    let output = Command::new(find_ffmpeg())
-        .args([
+    let output = run_command_output(
+        Command::new(find_ffmpeg()).args([
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -686,15 +939,23 @@ fn generate_preview_video_asset(input_path: &str) -> Result<TemporaryPath, Strin
             "-allow_sw",
             "1",
             "-b:v",
-            "2000k",
+            "1200k",
+            "-maxrate",
+            "1600k",
+            "-bufsize",
+            "3200k",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
             "+faststart",
+            "-fs",
+            &MAX_PREVIEW_PROXY_BYTES.to_string(),
             preview_path.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .map_err(|error| format!("ffmpeg 预览视频生成失败: {error}"))?;
+        ]),
+        manager,
+        task_id,
+    )
+    .map_err(|error| format!("ffmpeg 预览视频生成失败: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -706,9 +967,28 @@ fn generate_preview_video_asset(input_path: &str) -> Result<TemporaryPath, Strin
 #[tauri::command(async)]
 fn build_preview_video_asset(
     app: tauri::AppHandle,
+    manager: tauri::State<'_, MediaTaskManager>,
     input_path: String,
+    task_id: Option<String>,
 ) -> Result<PreviewVideoAssetResult, String> {
-    let preview_file = generate_preview_video_asset(&input_path)?;
+    let probe = probe_media_inner(input_path.clone(), Some(&manager), task_id.as_deref())?;
+    if is_direct_preview_compatible(&probe) {
+        let input = PathBuf::from(&input_path);
+        app.asset_protocol_scope()
+            .allow_file(&input)
+            .map_err(|error| format!("授权原视频访问失败: {error}"))?;
+        return Ok(PreviewVideoAssetResult {
+            file_path: input_path,
+            temporary: false,
+        });
+    }
+
+    let preview_file = generate_preview_video_asset(
+        &input_path,
+        probe.duration_seconds,
+        Some(&manager),
+        task_id.as_deref(),
+    )?;
     let preview_path = preview_file.path();
 
     app.asset_protocol_scope()
@@ -718,24 +998,44 @@ fn build_preview_video_asset(
 
     Ok(PreviewVideoAssetResult {
         file_path: preview_path.to_string_lossy().to_string(),
+        temporary: true,
     })
 }
 
 #[tauri::command]
-fn delete_preview_asset(app: tauri::AppHandle, file_path: String) -> Result<(), String> {
+fn delete_preview_asset(
+    app: tauri::AppHandle,
+    file_path: String,
+    temporary: bool,
+) -> Result<(), String> {
     let path = PathBuf::from(file_path);
-    if !is_managed_preview_asset(&path) {
+    if temporary && !is_managed_preview_asset(&path) {
         return Err("拒绝删除不受本应用管理的文件".to_string());
     }
 
     app.asset_protocol_scope()
         .forbid_file(&path)
         .map_err(|error| format!("撤销代理视频访问失败: {error}"))?;
+    if !temporary {
+        return Ok(());
+    }
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("删除代理视频失败: {error}")),
     }
+}
+
+#[tauri::command]
+fn cancel_media_tasks(manager: tauri::State<'_, MediaTaskManager>, task_ids: Vec<String>) {
+    for task_id in task_ids {
+        manager.cancel(&task_id);
+    }
+}
+
+#[tauri::command]
+fn cancel_all_media_tasks(manager: tauri::State<'_, MediaTaskManager>) {
+    manager.cancel_all();
 }
 
 fn crop_rect_to_request(rect: CropRect) -> CropRectRequest {
@@ -979,9 +1279,11 @@ fn run_bbox_window(
     window_seconds: f64,
     source_width: u64,
     source_height: u64,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
 ) -> Result<Option<CropRect>, String> {
-    let output = Command::new(find_ffmpeg())
-        .args([
+    let output = run_command_output(
+        Command::new(find_ffmpeg()).args([
             "-hide_banner",
             "-loglevel",
             "error",
@@ -1001,9 +1303,11 @@ fn run_bbox_window(
             "-f",
             "null",
             "-",
-        ])
-        .output()
-        .map_err(|error| format!("ffmpeg 黑边检测启动失败: {error}"))?;
+        ]),
+        manager,
+        task_id,
+    )
+    .map_err(|error| format!("ffmpeg 黑边检测启动失败: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -1044,11 +1348,15 @@ fn detection_confidence(agreeing_samples: usize, attempted_samples: usize) -> f6
     }
 }
 
-#[tauri::command(async)]
-fn detect_black_borders(
+fn detect_black_borders_inner(
     request: DetectBlackBordersRequest,
+    manager: Option<&MediaTaskManager>,
 ) -> Result<DetectBlackBordersResult, String> {
-    let probe = probe_media(request.input_path.clone())?;
+    let probe = probe_media_inner(
+        request.input_path.clone(),
+        manager,
+        request.task_id.as_deref(),
+    )?;
     if probe.media_kind != "video" {
         return Ok(no_detection_result(
             "failed",
@@ -1106,6 +1414,8 @@ fn detect_black_borders(
             window_seconds,
             source_width,
             source_height,
+            manager,
+            request.task_id.as_deref(),
         ) {
             Ok(Some(rect)) => {
                 if let Some(margins) = margins_from_rect(&rect, source_width, source_height) {
@@ -1207,18 +1517,38 @@ fn detect_black_borders(
 }
 
 #[tauri::command(async)]
+fn detect_black_borders(
+    manager: tauri::State<'_, MediaTaskManager>,
+    request: DetectBlackBordersRequest,
+) -> Result<DetectBlackBordersResult, String> {
+    detect_black_borders_inner(request, Some(&manager))
+}
+
+#[tauri::command(async)]
 fn export_media(
     window: tauri::Window,
+    manager: tauri::State<'_, MediaTaskManager>,
     request: ExportMediaRequest,
 ) -> Result<ExportResult, String> {
-    export_media_inner(request, Some(&window))
+    export_media_inner(request, Some(&window), Some(&manager))
 }
 
 fn export_media_inner(
     request: ExportMediaRequest,
     progress_window: Option<&tauri::Window>,
+    manager: Option<&MediaTaskManager>,
 ) -> Result<ExportResult, String> {
-    let probe = probe_media(request.input_path.clone())?;
+    if request.mode != "image" && request.mode != "video" {
+        return Err("不支持的媒体导出模式".to_string());
+    }
+    if request.output_path.trim().is_empty() {
+        return Err("输出路径不能为空".to_string());
+    }
+    let probe = probe_media_inner(
+        request.input_path.clone(),
+        manager,
+        request.task_id.as_deref(),
+    )?;
     // FFmpeg enables autorotation by default and applies it before the filter graph,
     // so crop coordinates must use the displayed (post-rotation) frame dimensions.
     let source_width = probe
@@ -1243,6 +1573,7 @@ fn export_media_inner(
     let mut output_target =
         prepare_output_target(Path::new(&request.output_path), request.avoid_overwrite)?;
     let output_path = output_target.path.to_string_lossy().into_owned();
+    let working_output_path = output_target.working_path().to_string_lossy().into_owned();
 
     let mut args = vec!["-y".to_string(), "-hide_banner".to_string()];
 
@@ -1310,7 +1641,7 @@ fn export_media_inner(
         ]);
     }
 
-    args.push(output_path.clone());
+    args.push(working_output_path);
 
     if request.mode == "video" {
         let total_seconds = request
@@ -1340,18 +1671,38 @@ fn export_media_inner(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("ffmpeg 启动失败: {error}"))?;
+        let pid = child.id();
+        if let (Some(manager), Some(task_id)) = (manager, request.task_id.as_deref()) {
+            manager.register(task_id, pid);
+        }
+        let registration = RegisteredProcess {
+            manager,
+            task_id: request.task_id.as_deref(),
+            pid,
+        };
 
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "无法读取 ffmpeg 进度输出".to_string())?;
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate_process(pid);
+                let _ = child.wait();
+                return Err("无法读取 ffmpeg 进度输出".to_string());
+            }
+        };
         let reader = BufReader::new(stderr);
         let mut stderr_lines = Vec::new();
         let mut latest_seconds = 0.0;
         let mut latest_percent = 0.0;
 
         for line in reader.lines() {
-            let line = line.map_err(|error| format!("读取 ffmpeg 输出失败: {error}"))?;
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    terminate_process(pid);
+                    let _ = child.wait();
+                    return Err(format!("读取 ffmpeg 输出失败: {error}"));
+                }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -1386,6 +1737,7 @@ fn export_media_inner(
         let status = child
             .wait()
             .map_err(|error| format!("等待 ffmpeg 结束失败: {error}"))?;
+        drop(registration);
         let stderr_output = stderr_lines.join("\n");
 
         if !status.success() {
@@ -1409,7 +1761,7 @@ fn export_media_inner(
             Some("视频导出完成".to_string()),
         );
 
-        output_target.commit();
+        output_target.commit()?;
         return Ok(ExportResult {
             output_path,
             applied_filter: filter,
@@ -1426,10 +1778,12 @@ fn export_media_inner(
         Some("开始导出图片".to_string()),
     );
 
-    let output = Command::new(find_ffmpeg())
-        .args(&args)
-        .output()
-        .map_err(|error| format!("ffmpeg 启动失败: {error}"))?;
+    let output = run_command_output(
+        Command::new(find_ffmpeg()).args(&args),
+        manager,
+        request.task_id.as_deref(),
+    )
+    .map_err(|error| format!("ffmpeg 启动失败: {error}"))?;
 
     if !output.status.success() {
         emit_export_progress(
@@ -1452,7 +1806,7 @@ fn export_media_inner(
         Some("图片导出完成".to_string()),
     );
 
-    output_target.commit();
+    output_target.commit()?;
     Ok(ExportResult {
         output_path,
         applied_filter: filter,
@@ -1463,6 +1817,7 @@ fn export_media_inner(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .manage(MediaTaskManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1475,14 +1830,17 @@ pub fn run() {
             build_preview_data_url,
             build_preview_video_asset,
             delete_preview_asset,
+            cancel_media_tasks,
+            cancel_all_media_tasks,
             detect_black_borders,
             export_media
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|_, event| {
+    app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            app_handle.state::<MediaTaskManager>().cancel_all();
             cleanup_current_process_preview_assets();
         }
     });
@@ -1491,11 +1849,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_data_url, detect_black_borders, detection_confidence, export_media_inner,
-        find_ffmpeg, generate_preview_video_asset, is_managed_preview_asset, parse_bbox_metadata,
-        parse_rotation_degrees, probe_media, probe_result_from_raw, representative_rect_for_window,
-        suffixed_output_path, CropRect, CropRectRequest, DetectBlackBordersRequest,
-        ExportMediaRequest,
+        build_preview_data_url_inner, detect_black_borders_inner, detection_confidence,
+        export_media_inner, find_ffmpeg, generate_preview_video_asset,
+        is_direct_preview_compatible, is_managed_preview_asset, parse_bbox_metadata,
+        parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
+        representative_rect_for_window, suffixed_output_path, CropRect, CropRectRequest,
+        DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
     };
     use serde_json::json;
     use std::env;
@@ -1616,7 +1975,7 @@ mod tests {
         let input_path = unique_path("probe-input.mp4");
         create_sample_video(&input_path);
 
-        let result = probe_media(input_path.to_string_lossy().to_string())
+        let result = probe_media_inner(input_path.to_string_lossy().to_string(), None, None)
             .expect("probe should succeed for generated sample");
 
         assert_eq!(result.media_kind, "video");
@@ -1737,8 +2096,13 @@ lavfi.bbox.h=164
         let input_path = unique_path("preview-input.mp4");
         create_sample_video(&input_path);
 
-        let result = build_preview_data_url(input_path.to_string_lossy().to_string(), None)
-            .expect("preview generation should succeed for generated sample");
+        let result = build_preview_data_url_inner(
+            input_path.to_string_lossy().to_string(),
+            None,
+            None,
+            None,
+        )
+        .expect("preview generation should succeed for generated sample");
 
         assert!(
             result.data_url.starts_with("data:image/jpeg;base64,"),
@@ -1751,8 +2115,13 @@ lavfi.bbox.h=164
         let input_path = unique_path("preview-video-input.mp4");
         create_sample_video(&input_path);
 
-        let preview_file = generate_preview_video_asset(input_path.to_string_lossy().as_ref())
-            .expect("preview video generation should succeed for generated sample");
+        let preview_file = generate_preview_video_asset(
+            input_path.to_string_lossy().as_ref(),
+            Some(2.0),
+            None,
+            None,
+        )
+        .expect("preview video generation should succeed for generated sample");
         let preview_path = preview_file.path().to_path_buf();
         assert!(preview_path.exists(), "preview proxy video should exist");
 
@@ -1762,6 +2131,50 @@ lavfi.bbox.h=164
             !preview_path.exists(),
             "temporary preview should be removed on drop"
         );
+    }
+
+    #[test]
+    fn direct_video_preview_only_accepts_h264_mp4_or_mov() {
+        let make_probe = |codec_name: &str, format_name: &str| ProbeResult {
+            media_kind: "video".to_string(),
+            format_name: Some(format_name.to_string()),
+            codec_name: Some(codec_name.to_string()),
+            width: Some(1920),
+            height: Some(1080),
+            rotation_degrees: 0,
+            display_width: Some(1920),
+            display_height: Some(1080),
+            duration_seconds: Some(5.0),
+            bit_rate: None,
+            raw: json!({}),
+        };
+
+        assert!(is_direct_preview_compatible(&make_probe(
+            "h264",
+            "mov,mp4,m4a"
+        )));
+        assert!(!is_direct_preview_compatible(&make_probe(
+            "hevc",
+            "mov,mp4,m4a"
+        )));
+        assert!(!is_direct_preview_compatible(&make_probe(
+            "h264",
+            "matroska,webm"
+        )));
+    }
+
+    #[test]
+    fn preview_proxy_rejects_estimated_files_over_the_limit() {
+        let result = generate_preview_video_asset(
+            "/path/does/not/need/to/exist.mp4",
+            Some(60.0 * 60.0),
+            None,
+            None,
+        );
+
+        assert!(result
+            .expect_err("one-hour proxy should exceed the configured size limit")
+            .contains("512 MB"));
     }
 
     #[test]
@@ -1780,7 +2193,7 @@ lavfi.bbox.h=164
         let input_path = unique_path("probe-input.png");
         create_sample_image(&input_path);
 
-        let result = probe_media(input_path.to_string_lossy().to_string())
+        let result = probe_media_inner(input_path.to_string_lossy().to_string(), None, None)
             .expect("probe should succeed for generated image");
 
         assert_eq!(result.media_kind, "image");
@@ -1798,18 +2211,22 @@ lavfi.bbox.h=164
         create_black_border_video(&source_path);
         add_display_rotation(&source_path, &rotated_path, 90);
 
-        let probe = probe_media(rotated_path.to_string_lossy().to_string())
+        let probe = probe_media_inner(rotated_path.to_string_lossy().to_string(), None, None)
             .expect("rotated video probe should succeed");
         assert_eq!(probe.rotation_degrees, 90);
         assert_eq!(probe.display_width, Some(240));
         assert_eq!(probe.display_height, Some(320));
 
-        let detection = detect_black_borders(DetectBlackBordersRequest {
-            input_path: rotated_path.to_string_lossy().to_string(),
-            start_seconds: Some(0.0),
-            duration_seconds: Some(3.0),
-            sample_windows: Some(7),
-        })
+        let detection = detect_black_borders_inner(
+            DetectBlackBordersRequest {
+                task_id: None,
+                input_path: rotated_path.to_string_lossy().to_string(),
+                start_seconds: Some(0.0),
+                duration_seconds: Some(3.0),
+                sample_windows: Some(7),
+            },
+            None,
+        )
         .expect("black border detection should run");
 
         assert_eq!(detection.status, "detected");
@@ -1823,6 +2240,7 @@ lavfi.bbox.h=164
 
         let export = export_media_inner(
             ExportMediaRequest {
+                task_id: None,
                 input_path: rotated_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 avoid_overwrite: false,
@@ -1841,6 +2259,7 @@ lavfi.bbox.h=164
                     height: 320,
                 }),
             },
+            None,
             None,
         )
         .expect("rotated display-space crop should export");
@@ -1861,6 +2280,7 @@ lavfi.bbox.h=164
 
         let result = export_media_inner(
             ExportMediaRequest {
+                task_id: None,
                 input_path: input_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 avoid_overwrite: false,
@@ -1874,6 +2294,7 @@ lavfi.bbox.h=164
                 video_duration_seconds: Some(1.0),
                 crop_rect: None,
             },
+            None,
             None,
         )
         .expect("export should succeed for generated sample");
@@ -1895,6 +2316,7 @@ lavfi.bbox.h=164
 
         let result = export_media_inner(
             ExportMediaRequest {
+                task_id: None,
                 input_path: input_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 avoid_overwrite: false,
@@ -1909,6 +2331,7 @@ lavfi.bbox.h=164
                 crop_rect: None,
             },
             None,
+            None,
         )
         .expect("image export should succeed for generated sample");
 
@@ -1919,6 +2342,44 @@ lavfi.bbox.h=164
             fs::read(&output_path).expect("exported image should be readable"),
             b"stale output",
             "single-file export should keep its existing overwrite behavior"
+        );
+
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn failed_export_preserves_existing_output_file() {
+        let input_path = unique_path("atomic-failure-input.png");
+        let output_path = unique_path("atomic-failure-output.webp");
+        create_sample_image(&input_path);
+        fs::write(&output_path, b"keep existing").expect("existing output should be writable");
+
+        let result = export_media_inner(
+            ExportMediaRequest {
+                task_id: None,
+                input_path: input_path.to_string_lossy().to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                avoid_overwrite: false,
+                mode: "image".to_string(),
+                ratio: "free".to_string(),
+                anchor: "center".to_string(),
+                scale: 1.0,
+                image_format: Some("webp".to_string()),
+                image_quality: Some(88),
+                video_start_seconds: None,
+                video_duration_seconds: None,
+                crop_rect: None,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_err(), "unsupported WEBP export should fail");
+        assert_eq!(
+            fs::read(&output_path).expect("existing output should remain readable"),
+            b"keep existing",
+            "failed export must not truncate or replace the existing file"
         );
 
         let _ = fs::remove_file(input_path);
@@ -1939,6 +2400,7 @@ lavfi.bbox.h=164
         let export_once = || {
             export_media_inner(
                 ExportMediaRequest {
+                    task_id: None,
                     input_path: input_path.to_string_lossy().to_string(),
                     output_path: requested_path.to_string_lossy().to_string(),
                     avoid_overwrite: true,
@@ -1952,6 +2414,7 @@ lavfi.bbox.h=164
                     video_duration_seconds: None,
                     crop_rect: None,
                 },
+                None,
                 None,
             )
             .expect("non-overwriting export should succeed")

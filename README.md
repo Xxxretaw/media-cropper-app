@@ -2,7 +2,7 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
-当前版本：`0.4.0`
+当前版本：`0.4.1`
 
 ## 当前能力
 
@@ -50,7 +50,7 @@ npm test
 
 当前仓库只包含 Apple Silicon macOS 使用的 FFmpeg/FFprobe sidecar。构建其他平台版本前，需要补充对应目标架构的二进制文件。
 
-内置 sidecar 基于 FFmpeg 8.1.1 官方源码构建，仅依赖 macOS 系统库。构建配置、源码校验值和许可证说明见 [`scripts/build-ffmpeg-macos-arm64.sh`](scripts/build-ffmpeg-macos-arm64.sh) 与 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+内置 sidecar 基于 FFmpeg 8.1.2 官方源码构建，仅依赖 macOS 系统库。构建配置、源码校验值和许可证说明见 [`scripts/build-ffmpeg-macos-arm64.sh`](scripts/build-ffmpeg-macos-arm64.sh) 与 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## macOS 发行包
 
@@ -63,7 +63,7 @@ npm run tauri -- build
 产物默认位于：
 
 - `src-tauri/target/release/bundle/macos/media-cropper.app`
-- `src-tauri/target/release/bundle/dmg/media-cropper_0.4.0_aarch64.dmg`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.4.1_aarch64.dmg`
 
 当前发行包使用 ad-hoc 签名，不依赖 Apple Developer ID。首次从网络下载后，macOS 仍可能要求用户在“系统设置 → 隐私与安全性”中确认打开。
 

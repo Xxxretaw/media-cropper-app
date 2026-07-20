@@ -12,6 +12,8 @@ export type ProbeResult = {
   display_width?: number;
   display_height?: number;
   duration_seconds?: number;
+  frame_rate?: number;
+  frame_count?: number;
   bit_rate?: number;
   raw: unknown;
 };
@@ -73,6 +75,14 @@ export type BlackBorderDetectionState = {
   warning: string;
   manuallyAdjusted: boolean;
   skipDetection: boolean;
+  resultApplied: boolean;
+  detectedRect: CropRect | null;
+  cropBeforeDetection: {
+    ratio: string;
+    anchor: string;
+    scale: number;
+    rect: CropRect | null;
+  } | null;
 };
 
 export type ItemSettings = {
@@ -158,6 +168,9 @@ export function createBlackBorderDetectionState(): BlackBorderDetectionState {
     warning: "",
     manuallyAdjusted: false,
     skipDetection: false,
+    resultApplied: false,
+    detectedRect: null,
+    cropBeforeDetection: null,
   };
 }
 

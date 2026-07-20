@@ -58,6 +58,8 @@ struct ProbeResult {
     display_width: Option<u64>,
     display_height: Option<u64>,
     duration_seconds: Option<f64>,
+    frame_rate: Option<f64>,
+    frame_count: Option<u64>,
     bit_rate: Option<u64>,
     raw: Value,
 }
@@ -399,6 +401,22 @@ fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {
 
 fn parse_optional_f64(value: Option<&Value>) -> Option<f64> {
     parse_number_string(value).and_then(|text| text.parse::<f64>().ok())
+}
+
+fn parse_frame_rate(value: Option<&Value>) -> Option<f64> {
+    let text = parse_number_string(value)?;
+    let rate = if let Some((numerator, denominator)) = text.split_once('/') {
+        let numerator = numerator.parse::<f64>().ok()?;
+        let denominator = denominator.parse::<f64>().ok()?;
+        if denominator == 0.0 {
+            return None;
+        }
+        numerator / denominator
+    } else {
+        text.parse::<f64>().ok()?
+    };
+
+    (rate.is_finite() && rate > 0.0 && rate <= 1000.0).then_some(rate)
 }
 
 fn normalize_rotation_degrees(value: f64) -> i32 {
@@ -752,6 +770,16 @@ fn probe_result_from_raw(raw: Value) -> ProbeResult {
     let codec_name = video_stream
         .and_then(|stream| stream["codec_name"].as_str())
         .map(str::to_string);
+    let frame_rate = video_stream.and_then(|stream| {
+        parse_frame_rate(stream.get("avg_frame_rate"))
+            .or_else(|| parse_frame_rate(stream.get("r_frame_rate")))
+    });
+    let frame_count = video_stream
+        .and_then(|stream| parse_optional_u64(stream.get("nb_frames")))
+        .or_else(|| {
+            let estimated = duration_seconds? * frame_rate?;
+            (estimated.is_finite() && estimated > 0.0).then_some(estimated.round() as u64)
+        });
     let bit_rate = parse_optional_u64(raw["format"].get("bit_rate"));
 
     ProbeResult {
@@ -764,6 +792,8 @@ fn probe_result_from_raw(raw: Value) -> ProbeResult {
         display_width,
         display_height,
         duration_seconds,
+        frame_rate,
+        frame_count,
         bit_rate,
         raw,
     }
@@ -1580,11 +1610,11 @@ fn export_media_inner(
     if request.mode == "video" {
         args.extend([
             "-ss".to_string(),
-            format!("{:.3}", request.video_start_seconds.unwrap_or(0.0).max(0.0)),
+            format!("{:.6}", request.video_start_seconds.unwrap_or(0.0).max(0.0)),
             "-t".to_string(),
             format!(
-                "{:.3}",
-                request.video_duration_seconds.unwrap_or(5.0).max(0.5)
+                "{:.6}",
+                request.video_duration_seconds.unwrap_or(5.0).max(0.000_001)
             ),
         ]);
     }
@@ -1852,7 +1882,7 @@ mod tests {
         build_preview_data_url_inner, detect_black_borders_inner, detection_confidence,
         export_media_inner, find_ffmpeg, generate_preview_video_asset,
         is_direct_preview_compatible, is_managed_preview_asset, parse_bbox_metadata,
-        parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
+        parse_frame_rate, parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
         representative_rect_for_window, suffixed_output_path, CropRect, CropRectRequest,
         DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
     };
@@ -1986,6 +2016,8 @@ mod tests {
         assert_eq!(result.display_width, Some(320));
         assert_eq!(result.display_height, Some(240));
         assert!(result.duration_seconds.unwrap_or_default() > 0.0);
+        assert!((result.frame_rate.unwrap_or_default() - 30.0).abs() < 0.01);
+        assert_eq!(result.frame_count, Some(60));
 
         let _ = fs::remove_file(input_path);
     }
@@ -2015,6 +2047,14 @@ mod tests {
         assert_eq!(result.rotation_degrees, 90);
         assert_eq!(result.display_width, Some(1080));
         assert_eq!(result.display_height, Some(1920));
+    }
+
+    #[test]
+    fn frame_rate_parser_supports_ffprobe_rationals() {
+        assert_eq!(parse_frame_rate(Some(&json!("30/1"))), Some(30.0));
+        let ntsc = parse_frame_rate(Some(&json!("30000/1001"))).expect("valid NTSC rate");
+        assert!((ntsc - 29.970_029_97).abs() < 0.000_001);
+        assert_eq!(parse_frame_rate(Some(&json!("0/0"))), None);
     }
 
     #[test]
@@ -2145,6 +2185,8 @@ lavfi.bbox.h=164
             display_width: Some(1920),
             display_height: Some(1080),
             duration_seconds: Some(5.0),
+            frame_rate: Some(30.0),
+            frame_count: Some(150),
             bit_rate: None,
             raw: json!({}),
         };

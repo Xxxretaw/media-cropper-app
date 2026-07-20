@@ -972,6 +972,19 @@ h2 {
   padding: 8px 10px;
 }
 
+.detection-result-action {
+  width: 100%;
+}
+
+#black-border-status[data-status="unapplied"] {
+  color: var(--text-muted);
+}
+
+#video-range-summary {
+  line-height: 1.45;
+  white-space: normal;
+}
+
 .detection-status-row {
   min-height: 22px;
   display: flex;
@@ -993,7 +1006,8 @@ h2 {
 }
 
 #black-border-status[data-status="skipped"],
-.thumb-detection.status-skipped {
+.thumb-detection.status-skipped,
+.thumb-detection.status-unapplied {
   color: var(--text-muted);
 }
 

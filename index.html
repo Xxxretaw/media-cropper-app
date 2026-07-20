@@ -213,12 +213,13 @@
                 </label>
                 <label class="toggle-row" for="skip-black-border-detection">
                   <input id="skip-black-border-detection" type="checkbox" />
-                  <span>当前视频跳过黑边检测</span>
+                  <span>当前视频不参与批量检测</span>
                 </label>
                 <div class="detection-actions">
                   <button id="detect-black-borders-current" type="button" class="ghost-button" disabled>检测当前</button>
                   <button id="detect-black-borders-all" type="button" class="ghost-button" disabled>检测全部</button>
                 </div>
+                <button id="toggle-black-border-result" type="button" class="ghost-button detection-result-action hide" disabled>撤销检测结果</button>
                 <div class="detection-detail" id="black-border-detail">可检测当前视频，或批量检测未跳过的视频。</div>
               </div>
               <div class="settings-grid">

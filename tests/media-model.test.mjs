@@ -8,6 +8,9 @@ import {
 test("new videos participate in on-demand black-border detection", () => {
   const item = createQueueItem("video", "/tmp/clip.mp4");
   assert.equal(item.blackBorderDetection.skipDetection, false);
+  assert.equal(item.blackBorderDetection.resultApplied, false);
+  assert.equal(item.blackBorderDetection.detectedRect, null);
+  assert.equal(item.blackBorderDetection.cropBeforeDetection, null);
   assert.deepEqual(getBlackBorderDetectionCandidates([item]), [item]);
 });
 

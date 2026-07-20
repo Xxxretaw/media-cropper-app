@@ -739,9 +739,10 @@ button:disabled,
 }
 
 .timeline-mini-time {
-  min-width: 46px;
+  min-width: 66px;
   color: var(--text-muted);
   font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .timeline-range-editor {
@@ -915,6 +916,19 @@ h2 {
   gap: 6px;
 }
 
+.field-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.field-meta {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
 .static-value {
   min-height: 42px;
   display: flex;
@@ -982,7 +996,8 @@ h2 {
 
 #video-range-summary {
   line-height: 1.45;
-  white-space: normal;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .detection-status-row {

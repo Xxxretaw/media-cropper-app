@@ -1,6 +1,6 @@
 [package]
 name = "media-cropper"
-version = "0.4.3"
+version = "0.4.4"
 description = "Media cropper"
 authors = ["you"]
 edition = "2021"

@@ -44,15 +44,26 @@ export function frameToSeconds(
   return validPositiveNumber(durationSeconds) ? Math.min(durationSeconds!, seconds) : seconds;
 }
 
-export function formatPreciseClock(seconds: number) {
+export function formatMinuteSecond(seconds: number) {
   const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-  const totalMilliseconds = Math.round(safeSeconds * 1000);
-  const hours = Math.floor(totalMilliseconds / 3_600_000);
-  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
-  const secs = Math.floor((totalMilliseconds % 60_000) / 1000);
-  const milliseconds = totalMilliseconds % 1000;
-  const clock = `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(milliseconds).padStart(3, "0")}`;
-  return hours > 0 ? `${String(hours).padStart(2, "0")}:${clock}` : clock;
+  const wholeSeconds = Math.floor(safeSeconds);
+  const minutes = Math.floor(wholeSeconds / 60);
+  const remainingSeconds = wholeSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+export function formatFrameTimecode(frame: number, frameRate: number) {
+  const nominalFrameRate = Math.max(
+    1,
+    Math.round(validPositiveNumber(frameRate) ? frameRate : DEFAULT_VIDEO_FRAME_RATE),
+  );
+  const safeFrame = Math.max(0, Math.round(Number.isFinite(frame) ? frame : 0));
+  const totalSeconds = Math.floor(safeFrame / nominalFrameRate);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const frameWithinSecond = safeFrame % nominalFrameRate;
+  const frameDigits = Math.max(2, String(nominalFrameRate - 1).length);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}:${String(frameWithinSecond).padStart(frameDigits, "0")}`;
 }
 
 export function formatFrameRate(frameRate: number) {

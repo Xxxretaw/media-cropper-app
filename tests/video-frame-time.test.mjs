@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  formatFrameTimecode,
   formatFrameRate,
-  formatPreciseClock,
+  formatMinuteSecond,
   frameToSeconds,
   getVideoFrameCount,
   getVideoFrameRate,
@@ -31,9 +32,20 @@ test("estimates missing frame metadata without losing one-frame precision", () =
   assert.equal(frameToSeconds(1, 30, 2), 1 / 30);
 });
 
-test("formats precise time and readable frame rates", () => {
-  assert.equal(formatPreciseClock(30.125), "00:30.125");
-  assert.equal(formatPreciseClock(3661.5), "01:01:01.500");
+test("formats preview time as minutes and seconds", () => {
+  assert.equal(formatMinuteSecond(30.125), "00:30");
+  assert.equal(formatMinuteSecond(140.1), "02:20");
+  assert.equal(formatMinuteSecond(3661.5), "61:01");
+});
+
+test("formats edit positions as minutes, seconds, and frame number", () => {
+  assert.equal(formatFrameTimecode(0, 30), "00:00:00");
+  assert.equal(formatFrameTimecode(4203, 30), "02:20:03");
+  assert.equal(formatFrameTimecode(4585, 30), "02:32:25");
+  assert.equal(formatFrameTimecode(3603, 60), "01:00:03");
+});
+
+test("formats readable frame rates", () => {
   assert.equal(formatFrameRate(30), "30");
   assert.equal(formatFrameRate(30000 / 1001), "29.97");
 });

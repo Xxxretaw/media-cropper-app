@@ -51,8 +51,9 @@ import {
   saveCropBeforeDetection,
 } from "./black-border-result";
 import {
+  formatFrameTimecode,
   formatFrameRate,
-  formatPreciseClock,
+  formatMinuteSecond,
   frameToSeconds,
   getVideoFrameCount,
   getVideoFrameRate,
@@ -97,6 +98,7 @@ const originalFileNameEl = document.querySelector<HTMLElement>("#original-file-n
 const exportNamePreviewEl = document.querySelector<HTMLElement>("#export-name-preview");
 const namingMessageEl = document.querySelector<HTMLElement>("#naming-message");
 const videoRangeSummaryEl = document.querySelector<HTMLElement>("#video-range-summary");
+const videoRangeFpsEl = document.querySelector<HTMLElement>("#video-range-fps");
 const previewEmptyEl = document.querySelector<HTMLElement>("#preview-empty");
 const dropTitleEl = document.querySelector<HTMLElement>("#drop-title");
 const mediaWrapEl = document.querySelector<HTMLElement>("#media-wrap");
@@ -614,13 +616,16 @@ function updateVideoExportRangeUi() {
   const isVideo = state.mode === "video" && item?.lastProbe?.media_kind === "video";
   if (!isVideo || !item) {
     if (videoExportStartTimeEl) {
-      videoExportStartTimeEl.textContent = "00:00";
+      videoExportStartTimeEl.textContent = "00:00:00";
     }
     if (videoExportEndTimeEl) {
-      videoExportEndTimeEl.textContent = "00:00";
+      videoExportEndTimeEl.textContent = "00:00:00";
     }
     if (videoRangeSummaryEl) {
       videoRangeSummaryEl.textContent = "请在中间时间轴选择";
+    }
+    if (videoRangeFpsEl) {
+      videoRangeFpsEl.textContent = "— fps";
     }
     if (videoExportFillEl) {
       videoExportFillEl.style.left = "0%";
@@ -648,13 +653,16 @@ function updateVideoExportRangeUi() {
     videoExportEndEl.value = String(endFrame);
   }
   if (videoExportStartTimeEl) {
-    videoExportStartTimeEl.textContent = `${startFrame} 帧`;
+    videoExportStartTimeEl.textContent = formatFrameTimecode(startFrame, frameRate);
   }
   if (videoExportEndTimeEl) {
-    videoExportEndTimeEl.textContent = `${endFrame} 帧`;
+    videoExportEndTimeEl.textContent = formatFrameTimecode(endFrame, frameRate);
   }
   if (videoRangeSummaryEl) {
-    videoRangeSummaryEl.textContent = `${formatPreciseClock(start)}（帧 ${startFrame}）– ${formatPreciseClock(end)}（帧 ${endFrame}） · 共 ${Math.max(0, endFrame - startFrame)} 帧 · ${formatFrameRate(frameRate)} fps`;
+    videoRangeSummaryEl.textContent = `${formatFrameTimecode(startFrame, frameRate)} - ${formatFrameTimecode(endFrame, frameRate)}`;
+  }
+  if (videoRangeFpsEl) {
+    videoRangeFpsEl.textContent = `${formatFrameRate(frameRate)} fps`;
   }
   if (videoExportFillEl) {
     const leftPercent = duration > 0 ? (start / duration) * 100 : 0;
@@ -713,7 +721,7 @@ function updateVideoTimelineUi() {
     videoPreviewSeekEl.value = String(currentFrame);
   }
   if (videoPreviewTimeEl) {
-    videoPreviewTimeEl.textContent = `${formatPreciseClock(current)} · 帧 ${currentFrame}/${totalFrames}`;
+    videoPreviewTimeEl.textContent = `${formatMinuteSecond(current)} / ${formatMinuteSecond(duration)}`;
   }
   if (videoPreviewToggleEl) {
     videoPreviewToggleEl.textContent = videoPreviewPlaying ? "❚❚" : "▶";

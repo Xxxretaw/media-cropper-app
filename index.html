@@ -70,14 +70,14 @@
               <input id="video-preview-seek" type="range" min="0" max="1000" step="1" value="0" />
               <span class="timeline-time" id="video-preview-time">00:00 / 00:00</span>
               <div class="video-export-range" id="video-export-range">
-                <span class="timeline-mini-time" id="video-export-start-time">00:00</span>
+                <span class="timeline-mini-time" id="video-export-start-time">00:00:00</span>
                 <div class="timeline-range-editor">
                   <div class="timeline-range-track"></div>
                   <div class="timeline-range-fill" id="video-export-fill"></div>
                   <input id="video-export-start" type="range" min="0" max="1000" step="1" value="0" />
                   <input id="video-export-end" type="range" min="0" max="1000" step="1" value="50" />
                 </div>
-                <span class="timeline-mini-time" id="video-export-end-time">00:05</span>
+                <span class="timeline-mini-time" id="video-export-end-time">00:00:00</span>
               </div>
             </div>
           </div>
@@ -224,7 +224,10 @@
               </div>
               <div class="settings-grid">
                 <div class="field">
-                  <span class="label">输出片段</span>
+                  <div class="field-heading">
+                    <span class="label">输出片段</span>
+                    <span class="field-meta" id="video-range-fps">— fps</span>
+                  </div>
                   <div class="static-value" id="video-range-summary">请在中间时间轴选择</div>
                 </div>
               </div>

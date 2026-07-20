@@ -72,6 +72,7 @@ export type BlackBorderDetectionState = {
   agreeingSamples: number;
   warning: string;
   manuallyAdjusted: boolean;
+  skipDetection: boolean;
 };
 
 export type ItemSettings = {
@@ -156,6 +157,7 @@ export function createBlackBorderDetectionState(): BlackBorderDetectionState {
     agreeingSamples: 0,
     warning: "",
     manuallyAdjusted: false,
+    skipDetection: false,
   };
 }
 
@@ -206,6 +208,10 @@ export function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
     blackBorderDetection: createBlackBorderDetectionState(),
     settings: createItemSettings(),
   };
+}
+
+export function getBlackBorderDetectionCandidates(items: QueueItem[]) {
+  return items.filter((item) => !item.blackBorderDetection.skipDetection);
 }
 
 export function createAppState(): AppState {

@@ -360,6 +360,11 @@ button:disabled,
   border-right: 0;
 }
 
+.inspector-panel > .inspector-section,
+.inspector-panel > .sticky-export-bar {
+  flex: 0 0 auto;
+}
+
 .inspector-section {
   display: flex;
   flex-direction: column;
@@ -985,6 +990,11 @@ h2 {
 #black-border-status[data-status="needs_review"],
 #black-border-status[data-status="failed"] {
   color: var(--text-error);
+}
+
+#black-border-status[data-status="skipped"],
+.thumb-detection.status-skipped {
+  color: var(--text-muted);
 }
 
 #black-border-confidence {

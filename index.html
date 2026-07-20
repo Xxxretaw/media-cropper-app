@@ -208,14 +208,18 @@
             <div class="advanced-section-body">
               <div class="black-border-controls">
                 <label class="toggle-row" for="auto-detect-black-borders">
-                  <input id="auto-detect-black-borders" type="checkbox" checked />
+                  <input id="auto-detect-black-borders" type="checkbox" />
                   <span>导入后自动检测黑边</span>
+                </label>
+                <label class="toggle-row" for="skip-black-border-detection">
+                  <input id="skip-black-border-detection" type="checkbox" />
+                  <span>当前视频跳过黑边检测</span>
                 </label>
                 <div class="detection-actions">
                   <button id="detect-black-borders-current" type="button" class="ghost-button" disabled>检测当前</button>
                   <button id="detect-black-borders-all" type="button" class="ghost-button" disabled>检测全部</button>
                 </div>
-                <div class="detection-detail" id="black-border-detail">将从多个时间点采样并自动应用可靠结果。</div>
+                <div class="detection-detail" id="black-border-detail">可检测当前视频，或批量检测未跳过的视频。</div>
               </div>
               <div class="settings-grid">
                 <div class="field">

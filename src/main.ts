@@ -32,7 +32,7 @@ import {
   type VideoFrameIndexResult,
 } from "./media-model";
 import {
-  MEDIA_EXTENSIONS,
+  ALL_MEDIA_EXTENSIONS,
   routeMediaPaths,
   type RoutedMediaFile,
 } from "./media-files";
@@ -365,10 +365,10 @@ function updateModeUi() {
     tab.textContent = `${mode === "image" ? "图片" : "视频"}${count > 0 ? ` · ${count}` : ""}`;
   });
   if (pickInputButton) {
-    pickInputButton.textContent = isImage ? "添加图片" : "添加视频";
+    pickInputButton.textContent = "添加素材";
   }
   if (pickInputSecondaryButton) {
-    pickInputSecondaryButton.textContent = isImage ? "选择图片" : "选择视频";
+    pickInputSecondaryButton.textContent = "选择素材";
   }
   if (exportButton) {
     exportButton.textContent = isImage ? "导出当前图片" : "导出当前视频";
@@ -1900,6 +1900,9 @@ async function importRoutedFiles(files: RoutedMediaFile[]) {
     return { mode, item };
   });
 
+  if (!queued.some(({ mode }) => mode === state.mode)) {
+    state.mode = queued[queued.length - 1]?.mode ?? state.mode;
+  }
   renderCurrentContext();
   for (const { mode, item } of queued) {
     await autoProbeMedia(item, mode);
@@ -1937,7 +1940,6 @@ async function pickInputFile() {
     return;
   }
 
-  const mode = state.mode;
   state.importBusy = true;
   setButtonsDisabledState();
   try {
@@ -1946,27 +1948,31 @@ async function pickInputFile() {
       directory: false,
       filters: [
         {
-          name: mode === "image" ? "Image" : "Video",
-          extensions: [...MEDIA_EXTENSIONS[mode]],
+          name: "图片和视频",
+          extensions: [...ALL_MEDIA_EXTENSIONS],
         },
       ],
     });
 
     if (!selected) {
-      currentContext(mode).log = "已取消文件选择。";
+      setLog("已取消文件选择。");
       return;
     }
 
     const paths = Array.isArray(selected) ? selected : [selected];
-    const existing = existingMediaPaths();
-    const files = paths
-      .filter((path) => !existing.has(path))
-      .map((path) => ({ mode, path }));
-    if (files.length === 0) {
-      currentContext(mode).log = "所选素材已经在队列中。";
+    const routed = routeMediaPaths(paths, existingMediaPaths());
+    if (routed.accepted.length === 0) {
+      const reasons = [];
+      if (routed.unsupported.length > 0) reasons.push(`${routed.unsupported.length} 个不支持的文件`);
+      if (routed.duplicates.length > 0) reasons.push(`${routed.duplicates.length} 个重复文件`);
+      setLog(reasons.length > 0 ? `没有可导入的素材：${reasons.join("、")}。` : "没有检测到可导入的文件。");
       return;
     }
-    await importRoutedFiles(files);
+    await importRoutedFiles(routed.accepted);
+    if (routed.duplicates.length > 0) {
+      const context = currentContext();
+      context.log = `${context.log}\n已忽略 ${routed.duplicates.length} 个重复文件。`;
+    }
   } finally {
     state.importBusy = false;
     renderCurrentContext();

@@ -202,9 +202,9 @@ export function createBlackBorderDetectionState(): BlackBorderDetectionState {
   };
 }
 
-export function createItemSettings(): ItemSettings {
+export function createItemSettings(mode: MediaMode): ItemSettings {
   return {
-    ratio: "9:16",
+    ratio: mode === "video" ? "free" : "9:16",
     anchor: "center",
     scale: 1,
     rect: null,
@@ -263,7 +263,7 @@ export function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
     status: "loading",
     errorMessage: "",
     blackBorderDetection: createBlackBorderDetectionState(),
-    settings: createItemSettings(),
+    settings: createItemSettings(mode),
   };
 }
 

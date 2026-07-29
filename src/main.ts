@@ -64,7 +64,6 @@ import {
   framePositionPercent,
   normalizeVideoTimeline,
   secondsToIndexedFrame,
-  zoomTimelineView,
 } from "./video-frame-time";
 
 const state = createAppState();
@@ -120,23 +119,20 @@ const videoExportStartTimeEl = document.querySelector<HTMLElement>("#video-expor
 const videoExportEndTimeEl = document.querySelector<HTMLElement>("#video-export-end-time");
 const videoSelectionDurationEl = document.querySelector<HTMLElement>("#video-selection-duration");
 const videoIndexStatusEl = document.querySelector<HTMLElement>("#video-index-status");
-const videoOverviewTrackEl = document.querySelector<HTMLElement>("#video-overview-track");
-const videoOverviewSelectionEl = document.querySelector<HTMLElement>("#video-overview-selection");
-const videoOverviewWindowEl = document.querySelector<HTMLElement>("#video-overview-window");
-const videoOverviewStartEl = document.querySelector<HTMLButtonElement>("#video-overview-start");
-const videoOverviewEndEl = document.querySelector<HTMLButtonElement>("#video-overview-end");
-const videoOverviewPlayheadEl = document.querySelector<HTMLButtonElement>("#video-overview-playhead");
-const videoDetailTrackEl = document.querySelector<HTMLElement>("#video-detail-track");
-const videoDetailSelectionEl = document.querySelector<HTMLElement>("#video-detail-selection");
-const videoDetailTicksEl = document.querySelector<HTMLElement>("#video-detail-ticks");
-const videoDetailStartEl = document.querySelector<HTMLButtonElement>("#video-detail-start");
-const videoDetailEndEl = document.querySelector<HTMLButtonElement>("#video-detail-end");
-const videoDetailPlayheadEl = document.querySelector<HTMLButtonElement>("#video-detail-playhead");
-const timelineZoomInEl = document.querySelector<HTMLButtonElement>("#timeline-zoom-in");
-const timelineZoomOutEl = document.querySelector<HTMLButtonElement>("#timeline-zoom-out");
-const timelineFitSelectionEl = document.querySelector<HTMLButtonElement>("#timeline-fit-selection");
-const timelinePanLeftEl = document.querySelector<HTMLButtonElement>("#timeline-pan-left");
-const timelinePanRightEl = document.querySelector<HTMLButtonElement>("#timeline-pan-right");
+const videoMainTrackEl = document.querySelector<HTMLElement>("#video-main-track");
+const videoMainSelectionEl = document.querySelector<HTMLElement>("#video-main-selection");
+const videoMainStartEl = document.querySelector<HTMLButtonElement>("#video-main-start");
+const videoMainEndEl = document.querySelector<HTMLButtonElement>("#video-main-end");
+const videoMainPlayheadEl = document.querySelector<HTMLButtonElement>("#video-main-playhead");
+const videoFineTuneEl = document.querySelector<HTMLElement>("#video-fine-tune");
+const videoFineTrackEl = document.querySelector<HTMLElement>("#video-fine-track");
+const videoFineHandleEl = document.querySelector<HTMLButtonElement>("#video-fine-handle");
+const videoFineLabelEl = document.querySelector<HTMLElement>("#video-fine-label");
+const videoFineValueEl = document.querySelector<HTMLElement>("#video-fine-value");
+const videoFineDoneEl = document.querySelector<HTMLButtonElement>("#video-fine-done");
+const videoFineStepEls = Array.from(
+  document.querySelectorAll<HTMLButtonElement>("[data-fine-step]"),
+);
 const progressFillEl = document.querySelector<HTMLElement>("#progress-fill");
 const progressPercentEl = document.querySelector<HTMLElement>("#progress-percent");
 const progressTextEl = document.querySelector<HTMLElement>("#progress-text");
@@ -165,6 +161,10 @@ let videoPlaybackStartedAt = 0;
 let videoPlaybackStartSeconds = 0;
 let videoLastStaticPreviewAt = 0;
 let videoPreviewPlaying = false;
+let activeFineTune: {
+  itemId: string;
+  role: "start" | "end";
+} | null = null;
 const BLACK_BORDER_SAMPLE_WINDOWS = 7;
 
 function currentContext(mode = state.mode) {
@@ -308,17 +308,12 @@ function setButtonsDisabledState() {
   if (materialNameInput) materialNameInput.disabled = !hasCurrent || busy;
   if (videoPreviewToggleEl) videoPreviewToggleEl.disabled = disabled;
   [
-    videoOverviewStartEl,
-    videoOverviewEndEl,
-    videoOverviewPlayheadEl,
-    videoDetailStartEl,
-    videoDetailEndEl,
-    videoDetailPlayheadEl,
-    timelineZoomInEl,
-    timelineZoomOutEl,
-    timelineFitSelectionEl,
-    timelinePanLeftEl,
-    timelinePanRightEl,
+    videoMainStartEl,
+    videoMainEndEl,
+    videoMainPlayheadEl,
+    videoFineHandleEl,
+    videoFineDoneEl,
+    ...videoFineStepEls,
   ].forEach((element) => {
     if (element) element.disabled = disabled;
   });
@@ -778,11 +773,15 @@ function updateVideoTimelineUi() {
     if (videoPreviewToggleEl) {
       videoPreviewToggleEl.textContent = "▶";
     }
+    videoFineTuneEl?.classList.add("hide");
     stopVideoPlayback();
     updateVideoExportRangeUi();
     return;
   }
   const index = item.videoFrameIndex;
+  if (activeFineTune && activeFineTune.itemId !== item.id) {
+    activeFineTune = null;
+  }
   const timeline = normalizeVideoTimeline(item.videoTimeline, index.frameCount);
   item.videoTimeline = timeline;
   const totalFrames = index.frameCount;
@@ -793,50 +792,59 @@ function updateVideoTimelineUi() {
     videoPreviewToggleEl.textContent = videoPreviewPlaying ? "❚❚" : "▶";
   }
 
-  const overviewStart = framePositionPercent(timeline.startFrame, 0, totalFrames);
-  const overviewEnd = framePositionPercent(timeline.endFrameExclusive, 0, totalFrames);
-  const overviewPlayhead = framePositionPercent(timeline.playheadFrame, 0, totalFrames);
-  const overviewViewStart = framePositionPercent(timeline.viewStartFrame, 0, totalFrames);
-  const overviewViewEnd = framePositionPercent(timeline.viewEndFrameExclusive, 0, totalFrames);
-  setTimelineRange(videoOverviewSelectionEl, overviewStart, overviewEnd);
-  setTimelineRange(videoOverviewWindowEl, overviewViewStart, overviewViewEnd);
-  setTimelinePosition(videoOverviewStartEl, overviewStart);
-  setTimelinePosition(videoOverviewEndEl, overviewEnd);
-  setTimelinePosition(videoOverviewPlayheadEl, overviewPlayhead);
+  const mainStart = framePositionPercent(timeline.startFrame, 0, totalFrames);
+  const mainEnd = framePositionPercent(timeline.endFrameExclusive, 0, totalFrames);
+  const mainPlayhead = framePositionPercent(timeline.playheadFrame, 0, totalFrames);
+  setTimelineRange(videoMainSelectionEl, mainStart, mainEnd);
+  setTimelinePosition(videoMainStartEl, mainStart);
+  setTimelinePosition(videoMainEndEl, mainEnd);
+  setTimelinePosition(videoMainPlayheadEl, mainPlayhead);
 
-  const viewStart = timeline.viewStartFrame;
-  const viewEnd = timeline.viewEndFrameExclusive;
-  const visibleStart = Math.max(timeline.startFrame, viewStart);
-  const visibleEnd = Math.min(timeline.endFrameExclusive, viewEnd);
-  setTimelineRange(
-    videoDetailSelectionEl,
-    framePositionPercent(visibleStart, viewStart, viewEnd),
-    framePositionPercent(visibleEnd, viewStart, viewEnd),
-  );
-  const startVisible = timeline.startFrame >= viewStart && timeline.startFrame <= viewEnd;
-  const endVisible = timeline.endFrameExclusive >= viewStart && timeline.endFrameExclusive <= viewEnd;
-  const playheadVisible = timeline.playheadFrame >= viewStart && timeline.playheadFrame < viewEnd;
-  videoDetailStartEl?.classList.toggle("hide", !startVisible);
-  videoDetailEndEl?.classList.toggle("hide", !endVisible);
-  videoDetailPlayheadEl?.classList.toggle("hide", !playheadVisible);
-  setTimelinePosition(
-    videoDetailStartEl,
-    framePositionPercent(timeline.startFrame, viewStart, viewEnd),
-  );
-  setTimelinePosition(
-    videoDetailEndEl,
-    framePositionPercent(timeline.endFrameExclusive, viewStart, viewEnd),
-  );
-  setTimelinePosition(
-    videoDetailPlayheadEl,
-    framePositionPercent(timeline.playheadFrame, viewStart, viewEnd),
-  );
-  if (videoDetailTicksEl) {
-    const visibleFrames = Math.max(1, viewEnd - viewStart);
-    const tickSpacing = Math.max(8, Math.min(40, 600 / visibleFrames));
-    videoDetailTicksEl.style.backgroundSize = `${tickSpacing}px 100%`;
+  const fineTuneActive = activeFineTune?.itemId === item.id;
+  videoFineTuneEl?.classList.toggle("hide", !fineTuneActive);
+  if (fineTuneActive && activeFineTune) {
+    const role = activeFineTune.role;
+    const endpointBoundary = role === "start"
+      ? timeline.startFrame
+      : timeline.endFrameExclusive;
+    const displayFrame = role === "start"
+      ? timeline.startFrame
+      : timeline.endFrameExclusive - 1;
+    if (videoFineLabelEl) {
+      videoFineLabelEl.textContent = role === "start" ? "逐帧微调起点" : "逐帧微调终点";
+    }
+    if (videoFineValueEl) {
+      videoFineValueEl.textContent = formatIndexedFrame(displayFrame, index);
+    }
+    setTimelinePosition(
+      videoFineHandleEl,
+      framePositionPercent(
+        endpointBoundary,
+        timeline.viewStartFrame,
+        timeline.viewEndFrameExclusive,
+      ),
+    );
   }
   updateVideoExportRangeUi();
+}
+
+function openFineTune(item: QueueItem, role: "start" | "end") {
+  const focusFrame = role === "start"
+    ? item.videoTimeline.startFrame
+    : item.videoTimeline.endFrameExclusive - 1;
+  item.videoTimeline = centerTimelineView(
+    item.videoTimeline,
+    focusFrame,
+    item.videoFrameIndex.frameCount,
+  );
+  activeFineTune = { itemId: item.id, role };
+  updateVideoTimelineUi();
+  window.setTimeout(() => videoFineHandleEl?.focus(), 0);
+}
+
+function closeFineTune() {
+  activeFineTune = null;
+  videoFineTuneEl?.classList.add("hide");
 }
 
 function previewTimelineFrame(item: QueueItem, frame: number, immediate = false) {
@@ -896,43 +904,6 @@ function setTimelineRoleFrame(
     );
   }
   previewTimelineFrame(item, previewFrame);
-}
-
-function panTimelineView(item: QueueItem, deltaFrames: number) {
-  const timeline = normalizeVideoTimeline(
-    item.videoTimeline,
-    item.videoFrameIndex.frameCount,
-  );
-  const span = timeline.viewEndFrameExclusive - timeline.viewStartFrame;
-  const start = Math.max(
-    0,
-    Math.min(
-      item.videoFrameIndex.frameCount - span,
-      timeline.viewStartFrame + Math.round(deltaFrames),
-    ),
-  );
-  item.videoTimeline = {
-    ...timeline,
-    viewStartFrame: start,
-    viewEndFrameExclusive: start + span,
-  };
-  updateVideoTimelineUi();
-}
-
-function fitTimelineSelection(item: QueueItem) {
-  const timeline = item.videoTimeline;
-  const padding = Math.max(
-    1,
-    Math.round((timeline.endFrameExclusive - timeline.startFrame) * 0.08),
-  );
-  const start = Math.max(0, timeline.startFrame - padding);
-  const end = Math.min(item.videoFrameIndex.frameCount, timeline.endFrameExclusive + padding);
-  item.videoTimeline = normalizeVideoTimeline({
-    ...timeline,
-    viewStartFrame: start,
-    viewEndFrameExclusive: Math.max(start + 1, end),
-  }, item.videoFrameIndex.frameCount);
-  updateVideoTimelineUi();
 }
 
 function cancelScheduledVideoPreview() {
@@ -2535,6 +2506,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item || state.mode !== "video") {
       return;
     }
+    closeFineTune();
     cancelScheduledVideoPreview();
     if (videoPreviewPlaying) {
       stopVideoPlayback();
@@ -2546,23 +2518,21 @@ window.addEventListener("DOMContentLoaded", () => {
 
   type TimelineRole = "start" | "end" | "playhead";
   let activeTimelineDrag: {
-    role: TimelineRole | "viewport";
-    detail: boolean;
-    startClientX: number;
-    initialViewStart: number;
+    role: TimelineRole;
+    fine: boolean;
   } | null = null;
 
   const timelineFrameAtPointer = (
     track: HTMLElement,
     clientX: number,
-    detail: boolean,
+    fine: boolean,
     role: TimelineRole,
   ) => {
     const item = currentItem();
     if (!item) return 0;
     const rect = track.getBoundingClientRect();
-    const start = detail ? item.videoTimeline.viewStartFrame : 0;
-    const end = detail
+    const start = fine ? item.videoTimeline.viewStartFrame : 0;
+    const end = fine
       ? item.videoTimeline.viewEndFrameExclusive
       : item.videoFrameIndex.frameCount;
     return frameFromTrackPosition(
@@ -2575,92 +2545,68 @@ window.addEventListener("DOMContentLoaded", () => {
     );
   };
 
-  const beginTimelineDrag = (event: PointerEvent, detail: boolean) => {
+  const beginTimelineDrag = (
+    event: PointerEvent,
+    track: HTMLElement,
+    fine: boolean,
+  ) => {
     const item = currentItem();
-    const track = detail ? videoDetailTrackEl : videoOverviewTrackEl;
-    if (!item || !track || state.mode !== "video") return;
+    if (!item || state.mode !== "video") return;
     const target = event.target as HTMLElement;
-    if (!detail && target === videoOverviewWindowEl) {
-      activeTimelineDrag = {
-        role: "viewport",
-        detail,
-        startClientX: event.clientX,
-        initialViewStart: item.videoTimeline.viewStartFrame,
-      };
-      event.preventDefault();
-      return;
+    const role = fine && activeFineTune?.itemId === item.id
+      ? activeFineTune.role
+      : (target.closest<HTMLElement>("[data-timeline-role]")
+        ?.dataset.timelineRole ?? "playhead") as TimelineRole;
+    target.closest<HTMLButtonElement>("button")?.focus();
+    if (role === "playhead") {
+      closeFineTune();
     }
-    const role = (target.closest<HTMLElement>("[data-timeline-role]")
-      ?.dataset.timelineRole ?? "playhead") as TimelineRole;
-    activeTimelineDrag = {
-      role,
-      detail,
-      startClientX: event.clientX,
-      initialViewStart: item.videoTimeline.viewStartFrame,
-    };
+    activeTimelineDrag = { role, fine };
     setTimelineRoleFrame(
       item,
       role,
-      timelineFrameAtPointer(track, event.clientX, detail, role),
-      !detail,
+      timelineFrameAtPointer(track, event.clientX, fine, role),
+      !fine && role !== "playhead",
     );
     event.preventDefault();
   };
 
-  videoOverviewTrackEl?.addEventListener("pointerdown", (event) => {
-    beginTimelineDrag(event, false);
+  videoMainTrackEl?.addEventListener("pointerdown", (event) => {
+    beginTimelineDrag(event, videoMainTrackEl, false);
   });
-  videoDetailTrackEl?.addEventListener("pointerdown", (event) => {
-    beginTimelineDrag(event, true);
+  videoFineTrackEl?.addEventListener("pointerdown", (event) => {
+    const item = currentItem();
+    if (!item || activeFineTune?.itemId !== item.id) return;
+    beginTimelineDrag(event, videoFineTrackEl, true);
   });
   window.addEventListener("pointermove", (event) => {
     const item = currentItem();
     if (!activeTimelineDrag || !item || state.mode !== "video") return;
-    const track = activeTimelineDrag.detail ? videoDetailTrackEl : videoOverviewTrackEl;
+    const track = activeTimelineDrag.fine ? videoFineTrackEl : videoMainTrackEl;
     if (!track) return;
-    if (activeTimelineDrag.role === "viewport") {
-      const rect = track.getBoundingClientRect();
-      const delta = rect.width > 0
-        ? (event.clientX - activeTimelineDrag.startClientX) / rect.width
-          * item.videoFrameIndex.frameCount
-        : 0;
-      const timeline = item.videoTimeline;
-      const span = timeline.viewEndFrameExclusive - timeline.viewStartFrame;
-      const nextStart = Math.max(
-        0,
-        Math.min(
-          item.videoFrameIndex.frameCount - span,
-          activeTimelineDrag.initialViewStart + Math.round(delta),
-        ),
-      );
-      timeline.viewStartFrame = nextStart;
-      timeline.viewEndFrameExclusive = nextStart + span;
-      updateVideoTimelineUi();
-    } else {
-      setTimelineRoleFrame(
-        item,
+    setTimelineRoleFrame(
+      item,
+      activeTimelineDrag.role,
+      timelineFrameAtPointer(
+        track,
+        event.clientX,
+        activeTimelineDrag.fine,
         activeTimelineDrag.role,
-        timelineFrameAtPointer(
-          track,
-          event.clientX,
-          activeTimelineDrag.detail,
-          activeTimelineDrag.role,
-        ),
-        !activeTimelineDrag.detail,
-      );
-    }
+      ),
+      !activeTimelineDrag.fine && activeTimelineDrag.role !== "playhead",
+    );
   });
   window.addEventListener("pointerup", () => {
     const item = currentItem();
-    if (
-      activeTimelineDrag
-      && activeTimelineDrag.role !== "viewport"
-      && item
-      && !usingNativeVideoPreview(item)
-    ) {
+    const finishedDrag = activeTimelineDrag;
+    activeTimelineDrag = null;
+    if (!finishedDrag || !item) return;
+    if (!usingNativeVideoPreview(item)) {
       previewTimelineFrame(item, item.videoTimeline.playheadFrame, true);
     }
-    activeTimelineDrag = null;
+    if (finishedDrag.role === "start" || finishedDrag.role === "end") {
+      openFineTune(item, finishedDrag.role);
+    }
   });
 
   const bindTimelineKeyboard = (
@@ -2679,64 +2625,48 @@ window.addEventListener("DOMContentLoaded", () => {
           ? item.videoTimeline.endFrameExclusive
           : item.videoTimeline.playheadFrame;
       setTimelineRoleFrame(item, role, current + direction * step, true);
+      if (role === "start" || role === "end") {
+        openFineTune(item, role);
+      }
       event.preventDefault();
     });
   };
-  bindTimelineKeyboard(videoOverviewStartEl, "start");
-  bindTimelineKeyboard(videoOverviewEndEl, "end");
-  bindTimelineKeyboard(videoOverviewPlayheadEl, "playhead");
-  bindTimelineKeyboard(videoDetailStartEl, "start");
-  bindTimelineKeyboard(videoDetailEndEl, "end");
-  bindTimelineKeyboard(videoDetailPlayheadEl, "playhead");
-
-  timelineZoomInEl?.addEventListener("click", () => {
+  bindTimelineKeyboard(videoMainStartEl, "start");
+  bindTimelineKeyboard(videoMainEndEl, "end");
+  bindTimelineKeyboard(videoMainPlayheadEl, "playhead");
+  videoFineHandleEl?.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     const item = currentItem();
-    if (!item) return;
-    item.videoTimeline = zoomTimelineView(
-      item.videoTimeline,
-      item.videoFrameIndex.frameCount,
-      0.5,
-    );
-    updateVideoTimelineUi();
-  });
-  timelineZoomOutEl?.addEventListener("click", () => {
-    const item = currentItem();
-    if (!item) return;
-    item.videoTimeline = zoomTimelineView(
-      item.videoTimeline,
-      item.videoFrameIndex.frameCount,
-      2,
-    );
-    updateVideoTimelineUi();
-  });
-  timelineFitSelectionEl?.addEventListener("click", () => {
-    const item = currentItem();
-    if (item) fitTimelineSelection(item);
-  });
-  const panByVisibleFraction = (direction: number) => {
-    const item = currentItem();
-    if (!item) return;
-    const span = item.videoTimeline.viewEndFrameExclusive - item.videoTimeline.viewStartFrame;
-    panTimelineView(item, Math.max(1, Math.round(span * 0.6)) * direction);
-  };
-  timelinePanLeftEl?.addEventListener("click", () => panByVisibleFraction(-1));
-  timelinePanRightEl?.addEventListener("click", () => panByVisibleFraction(1));
-  videoDetailTrackEl?.addEventListener("wheel", (event) => {
-    const item = currentItem();
-    if (!item) return;
-    if (event.ctrlKey || event.metaKey) {
-      item.videoTimeline = zoomTimelineView(
-        item.videoTimeline,
-        item.videoFrameIndex.frameCount,
-        event.deltaY > 0 ? 1.5 : 2 / 3,
-      );
-      updateVideoTimelineUi();
-    } else {
-      const span = item.videoTimeline.viewEndFrameExclusive - item.videoTimeline.viewStartFrame;
-      panTimelineView(item, Math.round((event.deltaX || event.deltaY) / 120 * span * 0.15));
-    }
+    if (!item || activeFineTune?.itemId !== item.id) return;
+    const role = activeFineTune.role;
+    const current = role === "start"
+      ? item.videoTimeline.startFrame
+      : item.videoTimeline.endFrameExclusive;
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    setTimelineRoleFrame(item, role, current + direction * (event.shiftKey ? 10 : 1));
     event.preventDefault();
-  }, { passive: false });
+  });
+  videoFineStepEls.forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = currentItem();
+      if (!item || activeFineTune?.itemId !== item.id) return;
+      const role = activeFineTune.role;
+      const current = role === "start"
+        ? item.videoTimeline.startFrame
+        : item.videoTimeline.endFrameExclusive;
+      setTimelineRoleFrame(item, role, current + Number(button.dataset.fineStep ?? 0));
+      videoFineHandleEl?.focus();
+    });
+  });
+  videoFineDoneEl?.addEventListener("click", () => {
+    closeFineTune();
+    updateVideoTimelineUi();
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !activeFineTune) return;
+    closeFineTune();
+    updateVideoTimelineUi();
+  });
 
   previewVideoEl?.addEventListener("loadedmetadata", () => {
     const item = currentItem();

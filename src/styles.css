@@ -742,39 +742,6 @@ button:disabled,
   color: var(--text-error);
 }
 
-.timeline-zoom-controls {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.timeline-tool {
-  width: 28px;
-  min-width: 28px;
-  height: 26px;
-  min-height: 26px;
-  padding: 0;
-  border-radius: 7px;
-  font-size: 0.76rem;
-}
-
-.timeline-tool.timeline-fit {
-  width: auto;
-  padding: 0 8px;
-}
-
-.timeline-row {
-  display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-}
-
-.timeline-row-label {
-  color: var(--text-muted);
-  font-size: 0.7rem;
-}
-
 .timeline-track {
   position: relative;
   height: 24px;
@@ -785,8 +752,12 @@ button:disabled,
   overflow: visible;
 }
 
-.timeline-detail-track {
-  height: 34px;
+.timeline-main-track {
+  height: 28px;
+}
+
+.timeline-fine-track {
+  height: 32px;
   background:
     linear-gradient(180deg, transparent 0 72%, var(--range-track) 72% 100%),
     var(--bg-preview);
@@ -814,24 +785,6 @@ button:disabled,
   pointer-events: none;
 }
 
-.timeline-detail-track .timeline-selection {
-  height: 12px;
-}
-
-.timeline-viewport-window {
-  position: absolute;
-  inset-block: 2px;
-  min-width: 5px;
-  border: 1px solid var(--accent-light);
-  border-radius: 5px;
-  background: rgba(59, 130, 246, 0.1);
-  cursor: grab;
-}
-
-.timeline-viewport-window:active {
-  cursor: grabbing;
-}
-
 .timeline-handle,
 .timeline-playhead {
   position: absolute;
@@ -844,6 +797,7 @@ button:disabled,
 }
 
 .timeline-handle {
+  z-index: 4;
   width: 14px;
   min-width: 14px;
   height: 20px;
@@ -854,7 +808,7 @@ button:disabled,
   box-shadow: 0 2px 8px var(--shadow-thumb);
 }
 
-.timeline-detail-track .timeline-handle {
+.timeline-fine-track .timeline-handle {
   height: 28px;
   min-height: 28px;
 }
@@ -870,23 +824,79 @@ button:disabled,
   box-shadow: 0 0 0 1px var(--accent), 0 2px 7px var(--shadow-thumb);
 }
 
-.timeline-detail-track .timeline-playhead {
-  height: 36px;
-  min-height: 36px;
-}
-
 .timeline-handle:focus-visible,
-.timeline-playhead:focus-visible,
-.timeline-viewport-window:focus-visible {
+.timeline-playhead:focus-visible {
   outline: 2px solid var(--accent-light);
   outline-offset: 2px;
+}
+
+.timeline-fine-tune {
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-stage);
+}
+
+.timeline-fine-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.72rem;
+}
+
+.timeline-fine-head strong {
+  color: var(--text-timeline);
+}
+
+.timeline-fine-head span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-fine-done {
+  min-width: auto;
+  height: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+}
+
+.timeline-fine-steps {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.timeline-fine-steps button {
+  min-width: 54px;
+  min-height: 25px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font-size: 0.68rem;
+}
+
+.timeline-fine-steps span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .timeline-readouts {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   gap: 12px;
-  padding-left: 42px;
+  padding-left: 0;
   color: var(--text-muted);
   font-size: 0.72rem;
   font-variant-numeric: tabular-nums;

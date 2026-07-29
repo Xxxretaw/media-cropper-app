@@ -2,7 +2,7 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
-当前版本：`0.5.0`
+当前版本：`0.5.1`
 
 面向使用者的历次变化见 [`USER_FACING_CHANGELOG.md`](USER_FACING_CHANGELOG.md)；开发与安全层面的完整记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -11,7 +11,7 @@
 - 图片和视频的自由裁切、固定比例裁切与批量导出。
 - 支持为每个素材单独设置导出名称，原始文件保持不变；同名素材才自动追加三位序号。
 - 支持从 Finder 同时拖入图片和视频，并自动分流到各自队列；不支持和重复的文件会单独提示。
-- 视频使用“全片概览 + 可缩放精细轨道”逐帧选择；播放游标、裁剪起止点和预览画面保持同步。
+- 视频只保留一条主时间轴；拖动裁剪端点后自动出现临时逐帧微调区，无需手动缩放或平移轨道。
 - 恒定帧率视频按有理数帧率换算，可变帧率视频按真实帧时间戳建立索引；方向键可逐帧微调。
 - 播放默认只预览选中片段，并在最后一个选中帧停止。
 - 视频黑边多点检测：导入后默认不检测，也可按需“检测当前”或“检测全部”。
@@ -69,7 +69,7 @@ npm run tauri -- build
 产物默认位于：
 
 - `src-tauri/target/release/bundle/macos/media-cropper.app`
-- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.0_aarch64.dmg`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.1_aarch64.dmg`
 
 当前发行包使用 ad-hoc 签名，不依赖 Apple Developer ID。首次从网络下载后，macOS 仍可能要求用户在“系统设置 → 隐私与安全性”中确认打开。
 
@@ -80,8 +80,8 @@ npm run tauri -- build
 发布新版本时同步更新版本号和更新记录，然后创建并推送版本标签：
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.5.1
+git push origin v0.5.1
 ```
 
 GitHub Actions 会自动构建 Apple Silicon 的 DMG 和 Tauri 更新包，并将 `latest.json`、签名与产物发布到 GitHub Releases。已安装 `0.4.0` 或更高版本的用户会在下次启动时收到更新提示。

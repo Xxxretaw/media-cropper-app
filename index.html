@@ -70,32 +70,29 @@
                 <button id="video-preview-toggle" type="button" class="timeline-play" aria-label="播放选中片段">▶</button>
                 <span class="timeline-time" id="video-preview-time">00:00:00 · 帧 0</span>
                 <span class="timeline-index-status" id="video-index-status"></span>
-                <div class="timeline-zoom-controls" aria-label="精细时间轴缩放">
-                  <button id="timeline-pan-left" type="button" class="timeline-tool" aria-label="向左移动精细时间轴">←</button>
-                  <button id="timeline-zoom-in" type="button" class="timeline-tool" aria-label="放大精细时间轴">＋</button>
-                  <button id="timeline-zoom-out" type="button" class="timeline-tool" aria-label="缩小精细时间轴">−</button>
-                  <button id="timeline-fit-selection" type="button" class="timeline-tool timeline-fit">适配选区</button>
-                  <button id="timeline-pan-right" type="button" class="timeline-tool" aria-label="向右移动精细时间轴">→</button>
-                </div>
               </div>
-              <div class="timeline-row">
-                <span class="timeline-row-label">全片</span>
-                <div class="timeline-track timeline-overview-track" id="video-overview-track">
-                  <div class="timeline-selection" id="video-overview-selection"></div>
-                  <div class="timeline-viewport-window" id="video-overview-window" title="拖动查看其他位置"></div>
-                  <button class="timeline-handle timeline-start-handle" id="video-overview-start" type="button" data-timeline-role="start" aria-label="裁剪起点"></button>
-                  <button class="timeline-handle timeline-end-handle" id="video-overview-end" type="button" data-timeline-role="end" aria-label="裁剪终点"></button>
-                  <button class="timeline-playhead" id="video-overview-playhead" type="button" data-timeline-role="playhead" aria-label="播放游标"></button>
-                </div>
+              <div class="timeline-track timeline-main-track" id="video-main-track">
+                <div class="timeline-selection" id="video-main-selection"></div>
+                <button class="timeline-handle timeline-start-handle" id="video-main-start" type="button" data-timeline-role="start" aria-label="裁剪起点，方向键逐帧调整"></button>
+                <button class="timeline-handle timeline-end-handle" id="video-main-end" type="button" data-timeline-role="end" aria-label="裁剪终点，方向键逐帧调整"></button>
+                <button class="timeline-playhead" id="video-main-playhead" type="button" data-timeline-role="playhead" aria-label="播放游标，方向键逐帧调整"></button>
               </div>
-              <div class="timeline-row timeline-detail-row">
-                <span class="timeline-row-label">精细</span>
-                <div class="timeline-track timeline-detail-track" id="video-detail-track">
-                  <div class="timeline-ticks" id="video-detail-ticks"></div>
-                  <div class="timeline-selection" id="video-detail-selection"></div>
-                  <button class="timeline-handle timeline-start-handle" id="video-detail-start" type="button" data-timeline-role="start" aria-label="裁剪起点，方向键逐帧调整"></button>
-                  <button class="timeline-handle timeline-end-handle" id="video-detail-end" type="button" data-timeline-role="end" aria-label="裁剪终点，方向键逐帧调整"></button>
-                  <button class="timeline-playhead" id="video-detail-playhead" type="button" data-timeline-role="playhead" aria-label="播放游标，方向键逐帧调整"></button>
+              <div class="timeline-fine-tune hide" id="video-fine-tune">
+                <div class="timeline-fine-head">
+                  <strong id="video-fine-label">逐帧微调起点</strong>
+                  <span id="video-fine-value">00:00:00 · 帧 0</span>
+                  <button id="video-fine-done" type="button" class="timeline-fine-done">完成</button>
+                </div>
+                <div class="timeline-track timeline-fine-track" id="video-fine-track">
+                  <div class="timeline-ticks"></div>
+                  <button class="timeline-handle" id="video-fine-handle" type="button" aria-label="逐帧微调端点"></button>
+                </div>
+                <div class="timeline-fine-steps">
+                  <button type="button" data-fine-step="-10">−10 帧</button>
+                  <button type="button" data-fine-step="-1">−1 帧</button>
+                  <span>拖动上方手柄，或使用按钮和方向键</span>
+                  <button type="button" data-fine-step="1">＋1 帧</button>
+                  <button type="button" data-fine-step="10">＋10 帧</button>
                 </div>
               </div>
               <div class="timeline-readouts">

@@ -29,6 +29,7 @@ import {
   type PreviewVideoAssetResult,
   type ProbeResult,
   type QueueItem,
+  type VideoFrameIndexResult,
 } from "./media-model";
 import {
   MEDIA_EXTENSIONS,
@@ -51,13 +52,19 @@ import {
   saveCropBeforeDetection,
 } from "./black-border-result";
 import {
-  formatFrameTimecode,
+  applyFrameBoundaries,
+  centerTimelineView,
+  createVideoFrameIndex,
+  createVideoTimelineState,
+  formatIndexedFrame,
   formatFrameRate,
-  formatMinuteSecond,
-  frameToSeconds,
-  getVideoFrameCount,
-  getVideoFrameRate,
-  secondsToFrame,
+  formatPreciseClock,
+  frameBoundaryToSeconds,
+  frameFromTrackPosition,
+  framePositionPercent,
+  normalizeVideoTimeline,
+  secondsToIndexedFrame,
+  zoomTimelineView,
 } from "./video-frame-time";
 
 const state = createAppState();
@@ -107,14 +114,29 @@ const previewImageEl = document.querySelector<HTMLImageElement>("#preview-image"
 const previewVideoEl = document.querySelector<HTMLVideoElement>("#preview-video");
 const cropBoxEl = document.querySelector<HTMLElement>("#crop-box");
 const videoTimelineEl = document.querySelector<HTMLElement>("#video-timeline");
-const videoPreviewSeekEl = document.querySelector<HTMLInputElement>("#video-preview-seek");
 const videoPreviewTimeEl = document.querySelector<HTMLElement>("#video-preview-time");
 const videoPreviewToggleEl = document.querySelector<HTMLButtonElement>("#video-preview-toggle");
-const videoExportStartEl = document.querySelector<HTMLInputElement>("#video-export-start");
-const videoExportEndEl = document.querySelector<HTMLInputElement>("#video-export-end");
-const videoExportFillEl = document.querySelector<HTMLElement>("#video-export-fill");
 const videoExportStartTimeEl = document.querySelector<HTMLElement>("#video-export-start-time");
 const videoExportEndTimeEl = document.querySelector<HTMLElement>("#video-export-end-time");
+const videoSelectionDurationEl = document.querySelector<HTMLElement>("#video-selection-duration");
+const videoIndexStatusEl = document.querySelector<HTMLElement>("#video-index-status");
+const videoOverviewTrackEl = document.querySelector<HTMLElement>("#video-overview-track");
+const videoOverviewSelectionEl = document.querySelector<HTMLElement>("#video-overview-selection");
+const videoOverviewWindowEl = document.querySelector<HTMLElement>("#video-overview-window");
+const videoOverviewStartEl = document.querySelector<HTMLButtonElement>("#video-overview-start");
+const videoOverviewEndEl = document.querySelector<HTMLButtonElement>("#video-overview-end");
+const videoOverviewPlayheadEl = document.querySelector<HTMLButtonElement>("#video-overview-playhead");
+const videoDetailTrackEl = document.querySelector<HTMLElement>("#video-detail-track");
+const videoDetailSelectionEl = document.querySelector<HTMLElement>("#video-detail-selection");
+const videoDetailTicksEl = document.querySelector<HTMLElement>("#video-detail-ticks");
+const videoDetailStartEl = document.querySelector<HTMLButtonElement>("#video-detail-start");
+const videoDetailEndEl = document.querySelector<HTMLButtonElement>("#video-detail-end");
+const videoDetailPlayheadEl = document.querySelector<HTMLButtonElement>("#video-detail-playhead");
+const timelineZoomInEl = document.querySelector<HTMLButtonElement>("#timeline-zoom-in");
+const timelineZoomOutEl = document.querySelector<HTMLButtonElement>("#timeline-zoom-out");
+const timelineFitSelectionEl = document.querySelector<HTMLButtonElement>("#timeline-fit-selection");
+const timelinePanLeftEl = document.querySelector<HTMLButtonElement>("#timeline-pan-left");
+const timelinePanRightEl = document.querySelector<HTMLButtonElement>("#timeline-pan-right");
 const progressFillEl = document.querySelector<HTMLElement>("#progress-fill");
 const progressPercentEl = document.querySelector<HTMLElement>("#progress-percent");
 const progressTextEl = document.querySelector<HTMLElement>("#progress-text");
@@ -139,6 +161,9 @@ const updateLaterButton = document.querySelector<HTMLButtonElement>("#update-lat
 const updateInstallButton = document.querySelector<HTMLButtonElement>("#update-install-button");
 let videoPreviewTimer: number | null = null;
 let videoPlaybackTimer: number | null = null;
+let videoPlaybackStartedAt = 0;
+let videoPlaybackStartSeconds = 0;
+let videoLastStaticPreviewAt = 0;
 let videoPreviewPlaying = false;
 const BLACK_BORDER_SAMPLE_WINDOWS = 7;
 
@@ -281,10 +306,22 @@ function setButtonsDisabledState() {
   if (customRatioHeightInput) customRatioHeightInput.disabled = disabled;
   if (imageFormatSelect) imageFormatSelect.disabled = disabled;
   if (materialNameInput) materialNameInput.disabled = !hasCurrent || busy;
-  if (videoPreviewSeekEl) videoPreviewSeekEl.disabled = disabled;
   if (videoPreviewToggleEl) videoPreviewToggleEl.disabled = disabled;
-  if (videoExportStartEl) videoExportStartEl.disabled = disabled;
-  if (videoExportEndEl) videoExportEndEl.disabled = disabled;
+  [
+    videoOverviewStartEl,
+    videoOverviewEndEl,
+    videoOverviewPlayheadEl,
+    videoDetailStartEl,
+    videoDetailEndEl,
+    videoDetailPlayheadEl,
+    timelineZoomInEl,
+    timelineZoomOutEl,
+    timelineFitSelectionEl,
+    timelinePanLeftEl,
+    timelinePanRightEl,
+  ].forEach((element) => {
+    if (element) element.disabled = disabled;
+  });
   if (detectCurrentButton) {
     detectCurrentButton.disabled = !currentVideo?.lastProbe || busy;
   }
@@ -599,8 +636,31 @@ function syncBlackBorderDetectionUi() {
 }
 
 function getVideoSegmentEnd(item: QueueItem) {
-  const duration = item.lastProbe?.duration_seconds ?? 0;
-  return Math.min(duration, item.settings.videoStartSeconds + item.settings.videoDurationSeconds);
+  return frameBoundaryToSeconds(
+    item.videoTimeline.endFrameExclusive,
+    item.videoFrameIndex,
+    item.lastProbe?.duration_seconds,
+  );
+}
+
+function syncVideoRangeSeconds(item: QueueItem) {
+  item.videoTimeline = normalizeVideoTimeline(
+    item.videoTimeline,
+    item.videoFrameIndex.frameCount,
+  );
+  const start = frameBoundaryToSeconds(
+    item.videoTimeline.startFrame,
+    item.videoFrameIndex,
+    item.lastProbe?.duration_seconds,
+  );
+  const end = getVideoSegmentEnd(item);
+  item.settings.videoStartSeconds = start;
+  item.settings.videoDurationSeconds = Math.max(0, end - start);
+  item.previewSeconds = frameBoundaryToSeconds(
+    item.videoTimeline.playheadFrame,
+    item.videoFrameIndex,
+    item.lastProbe?.duration_seconds,
+  );
 }
 
 function canUseNativeVideoPreview(item: QueueItem) {
@@ -616,10 +676,10 @@ function updateVideoExportRangeUi() {
   const isVideo = state.mode === "video" && item?.lastProbe?.media_kind === "video";
   if (!isVideo || !item) {
     if (videoExportStartTimeEl) {
-      videoExportStartTimeEl.textContent = "00:00:00";
+      videoExportStartTimeEl.textContent = "起点 00:00:00 · 帧 0";
     }
     if (videoExportEndTimeEl) {
-      videoExportEndTimeEl.textContent = "00:00:00";
+      videoExportEndTimeEl.textContent = "终点 00:00:00 · 帧 0";
     }
     if (videoRangeSummaryEl) {
       videoRangeSummaryEl.textContent = "请在中间时间轴选择";
@@ -627,49 +687,61 @@ function updateVideoExportRangeUi() {
     if (videoRangeFpsEl) {
       videoRangeFpsEl.textContent = "— fps";
     }
-    if (videoExportFillEl) {
-      videoExportFillEl.style.left = "0%";
-      videoExportFillEl.style.width = "0%";
+    if (videoIndexStatusEl) {
+      videoIndexStatusEl.textContent = "";
+      videoIndexStatusEl.removeAttribute("data-status");
     }
     return;
   }
 
-  const duration = item.lastProbe?.duration_seconds ?? 0;
-  const start = Math.max(0, Math.min(item.settings.videoStartSeconds, duration));
-  const end = Math.max(start, getVideoSegmentEnd(item));
-  const frameRate = getVideoFrameRate(item.lastProbe);
-  const totalFrames = getVideoFrameCount(item.lastProbe);
-  const startFrame = secondsToFrame(start, frameRate, totalFrames);
-  const endFrame = secondsToFrame(end, frameRate, totalFrames);
-
-  if (videoExportStartEl) {
-    videoExportStartEl.max = String(totalFrames);
-    videoExportStartEl.step = "1";
-    videoExportStartEl.value = String(startFrame);
-  }
-  if (videoExportEndEl) {
-    videoExportEndEl.max = String(totalFrames);
-    videoExportEndEl.step = "1";
-    videoExportEndEl.value = String(endFrame);
-  }
+  const index = item.videoFrameIndex;
+  const timeline = normalizeVideoTimeline(item.videoTimeline, index.frameCount);
+  item.videoTimeline = timeline;
+  const endFrame = timeline.endFrameExclusive - 1;
+  const selectedFrames = timeline.endFrameExclusive - timeline.startFrame;
   if (videoExportStartTimeEl) {
-    videoExportStartTimeEl.textContent = formatFrameTimecode(startFrame, frameRate);
+    videoExportStartTimeEl.textContent = `起点 ${formatIndexedFrame(timeline.startFrame, index)}`;
   }
   if (videoExportEndTimeEl) {
-    videoExportEndTimeEl.textContent = formatFrameTimecode(endFrame, frameRate);
+    videoExportEndTimeEl.textContent = `终点 ${formatIndexedFrame(endFrame, index)}`;
+  }
+  if (videoSelectionDurationEl) {
+    videoSelectionDurationEl.textContent =
+      `共 ${selectedFrames} 帧 · ${formatPreciseClock(item.settings.videoDurationSeconds)}`;
   }
   if (videoRangeSummaryEl) {
-    videoRangeSummaryEl.textContent = `${formatFrameTimecode(startFrame, frameRate)} - ${formatFrameTimecode(endFrame, frameRate)}`;
+    videoRangeSummaryEl.textContent =
+      `${formatIndexedFrame(timeline.startFrame, index)} — ${formatIndexedFrame(endFrame, index)} · 共 ${selectedFrames} 帧`;
   }
   if (videoRangeFpsEl) {
-    videoRangeFpsEl.textContent = `${formatFrameRate(frameRate)} fps`;
+    videoRangeFpsEl.textContent = index.variableFrameRate
+      ? "可变帧率"
+      : `${formatFrameRate(index.frameRateNumerator / index.frameRateDenominator)} fps`;
   }
-  if (videoExportFillEl) {
-    const leftPercent = duration > 0 ? (start / duration) * 100 : 0;
-    const widthPercent = duration > 0 ? ((end - start) / duration) * 100 : 0;
-    videoExportFillEl.style.left = `${leftPercent}%`;
-    videoExportFillEl.style.width = `${Math.max(0, widthPercent)}%`;
+  if (videoIndexStatusEl) {
+    videoIndexStatusEl.dataset.status = index.status;
+    videoIndexStatusEl.textContent = index.status === "indexing"
+      ? "正在建立逐帧索引…"
+      : index.warning || (index.variableFrameRate ? "可变帧率 · 已建立逐帧索引" : "");
   }
+}
+
+function setTimelinePosition(element: HTMLElement | null, percent: number) {
+  if (element) {
+    element.style.left = `${Math.max(0, Math.min(100, percent))}%`;
+  }
+}
+
+function setTimelineRange(
+  element: HTMLElement | null,
+  startPercent: number,
+  endPercent: number,
+) {
+  if (!element) return;
+  const left = Math.max(0, Math.min(100, startPercent));
+  const right = Math.max(left, Math.min(100, endPercent));
+  element.style.left = `${left}%`;
+  element.style.width = `${right - left}%`;
 }
 
 function updateCropDims() {
@@ -701,7 +773,7 @@ function updateVideoTimelineUi() {
   videoTimelineEl?.classList.toggle("hide", !isVideo);
   if (!isVideo || !item) {
     if (videoPreviewTimeEl) {
-      videoPreviewTimeEl.textContent = "00:00 / 00:00";
+      videoPreviewTimeEl.textContent = "00:00:00 · 帧 0";
     }
     if (videoPreviewToggleEl) {
       videoPreviewToggleEl.textContent = "▶";
@@ -710,23 +782,157 @@ function updateVideoTimelineUi() {
     updateVideoExportRangeUi();
     return;
   }
-  const duration = item.lastProbe?.duration_seconds ?? 0;
-  const current = Math.min(item.previewSeconds ?? 0, Math.max(0, duration));
-  const frameRate = getVideoFrameRate(item.lastProbe);
-  const totalFrames = getVideoFrameCount(item.lastProbe);
-  const currentFrame = secondsToFrame(current, frameRate, totalFrames);
-  if (videoPreviewSeekEl) {
-    videoPreviewSeekEl.max = String(totalFrames);
-    videoPreviewSeekEl.step = "1";
-    videoPreviewSeekEl.value = String(currentFrame);
-  }
+  const index = item.videoFrameIndex;
+  const timeline = normalizeVideoTimeline(item.videoTimeline, index.frameCount);
+  item.videoTimeline = timeline;
+  const totalFrames = index.frameCount;
   if (videoPreviewTimeEl) {
-    videoPreviewTimeEl.textContent = `${formatMinuteSecond(current)} / ${formatMinuteSecond(duration)}`;
+    videoPreviewTimeEl.textContent = formatIndexedFrame(timeline.playheadFrame, index);
   }
   if (videoPreviewToggleEl) {
     videoPreviewToggleEl.textContent = videoPreviewPlaying ? "❚❚" : "▶";
   }
+
+  const overviewStart = framePositionPercent(timeline.startFrame, 0, totalFrames);
+  const overviewEnd = framePositionPercent(timeline.endFrameExclusive, 0, totalFrames);
+  const overviewPlayhead = framePositionPercent(timeline.playheadFrame, 0, totalFrames);
+  const overviewViewStart = framePositionPercent(timeline.viewStartFrame, 0, totalFrames);
+  const overviewViewEnd = framePositionPercent(timeline.viewEndFrameExclusive, 0, totalFrames);
+  setTimelineRange(videoOverviewSelectionEl, overviewStart, overviewEnd);
+  setTimelineRange(videoOverviewWindowEl, overviewViewStart, overviewViewEnd);
+  setTimelinePosition(videoOverviewStartEl, overviewStart);
+  setTimelinePosition(videoOverviewEndEl, overviewEnd);
+  setTimelinePosition(videoOverviewPlayheadEl, overviewPlayhead);
+
+  const viewStart = timeline.viewStartFrame;
+  const viewEnd = timeline.viewEndFrameExclusive;
+  const visibleStart = Math.max(timeline.startFrame, viewStart);
+  const visibleEnd = Math.min(timeline.endFrameExclusive, viewEnd);
+  setTimelineRange(
+    videoDetailSelectionEl,
+    framePositionPercent(visibleStart, viewStart, viewEnd),
+    framePositionPercent(visibleEnd, viewStart, viewEnd),
+  );
+  const startVisible = timeline.startFrame >= viewStart && timeline.startFrame <= viewEnd;
+  const endVisible = timeline.endFrameExclusive >= viewStart && timeline.endFrameExclusive <= viewEnd;
+  const playheadVisible = timeline.playheadFrame >= viewStart && timeline.playheadFrame < viewEnd;
+  videoDetailStartEl?.classList.toggle("hide", !startVisible);
+  videoDetailEndEl?.classList.toggle("hide", !endVisible);
+  videoDetailPlayheadEl?.classList.toggle("hide", !playheadVisible);
+  setTimelinePosition(
+    videoDetailStartEl,
+    framePositionPercent(timeline.startFrame, viewStart, viewEnd),
+  );
+  setTimelinePosition(
+    videoDetailEndEl,
+    framePositionPercent(timeline.endFrameExclusive, viewStart, viewEnd),
+  );
+  setTimelinePosition(
+    videoDetailPlayheadEl,
+    framePositionPercent(timeline.playheadFrame, viewStart, viewEnd),
+  );
+  if (videoDetailTicksEl) {
+    const visibleFrames = Math.max(1, viewEnd - viewStart);
+    const tickSpacing = Math.max(8, Math.min(40, 600 / visibleFrames));
+    videoDetailTicksEl.style.backgroundSize = `${tickSpacing}px 100%`;
+  }
   updateVideoExportRangeUi();
+}
+
+function previewTimelineFrame(item: QueueItem, frame: number, immediate = false) {
+  item.videoTimeline.playheadFrame = Math.max(
+    0,
+    Math.min(item.videoFrameIndex.frameCount - 1, Math.round(frame)),
+  );
+  syncVideoRangeSeconds(item);
+  updateVideoTimelineUi();
+  if (usingNativeVideoPreview(item) && previewVideoEl) {
+    previewVideoEl.currentTime = item.previewSeconds;
+    return;
+  }
+  if (immediate) {
+    cancelScheduledVideoPreview();
+    void requestPreviewFrame(item, "video", item.previewSeconds);
+  } else {
+    scheduleVideoPreviewRefresh();
+  }
+}
+
+function setTimelineRoleFrame(
+  item: QueueItem,
+  role: "start" | "end" | "playhead",
+  frame: number,
+  recenter = false,
+) {
+  stopVideoPlayback();
+  const timeline = item.videoTimeline;
+  let previewFrame = frame;
+  if (role === "start") {
+    timeline.startFrame = Math.max(
+      0,
+      Math.min(timeline.endFrameExclusive - 1, Math.round(frame)),
+    );
+    previewFrame = timeline.startFrame;
+    invalidateDetectionForSegmentChange(item);
+  } else if (role === "end") {
+    timeline.endFrameExclusive = Math.max(
+      timeline.startFrame + 1,
+      Math.min(item.videoFrameIndex.frameCount, Math.round(frame)),
+    );
+    previewFrame = timeline.endFrameExclusive - 1;
+    invalidateDetectionForSegmentChange(item);
+  } else {
+    previewFrame = Math.max(
+      0,
+      Math.min(item.videoFrameIndex.frameCount - 1, Math.round(frame)),
+    );
+  }
+  timeline.playheadFrame = previewFrame;
+  if (recenter) {
+    item.videoTimeline = centerTimelineView(
+      timeline,
+      previewFrame,
+      item.videoFrameIndex.frameCount,
+    );
+  }
+  previewTimelineFrame(item, previewFrame);
+}
+
+function panTimelineView(item: QueueItem, deltaFrames: number) {
+  const timeline = normalizeVideoTimeline(
+    item.videoTimeline,
+    item.videoFrameIndex.frameCount,
+  );
+  const span = timeline.viewEndFrameExclusive - timeline.viewStartFrame;
+  const start = Math.max(
+    0,
+    Math.min(
+      item.videoFrameIndex.frameCount - span,
+      timeline.viewStartFrame + Math.round(deltaFrames),
+    ),
+  );
+  item.videoTimeline = {
+    ...timeline,
+    viewStartFrame: start,
+    viewEndFrameExclusive: start + span,
+  };
+  updateVideoTimelineUi();
+}
+
+function fitTimelineSelection(item: QueueItem) {
+  const timeline = item.videoTimeline;
+  const padding = Math.max(
+    1,
+    Math.round((timeline.endFrameExclusive - timeline.startFrame) * 0.08),
+  );
+  const start = Math.max(0, timeline.startFrame - padding);
+  const end = Math.min(item.videoFrameIndex.frameCount, timeline.endFrameExclusive + padding);
+  item.videoTimeline = normalizeVideoTimeline({
+    ...timeline,
+    viewStartFrame: start,
+    viewEndFrameExclusive: Math.max(start + 1, end),
+  }, item.videoFrameIndex.frameCount);
+  updateVideoTimelineUi();
 }
 
 function cancelScheduledVideoPreview() {
@@ -752,41 +958,68 @@ function stopVideoPlayback() {
 
 function startVideoPlayback() {
   const item = currentItem();
-  const duration = item?.lastProbe?.duration_seconds ?? 0;
-  if (!item || state.mode !== "video" || duration <= 0) {
+  if (!item || state.mode !== "video" || item.videoFrameIndex.frameCount <= 0) {
     stopVideoPlayback();
     return;
   }
 
-  if (usingNativeVideoPreview(item) && previewVideoEl) {
-    void previewVideoEl.play().catch((error) => {
-      setLog(`视频播放失败：${String(error)}`);
-    });
-    return;
+  const timeline = item.videoTimeline;
+  if (
+    timeline.playheadFrame < timeline.startFrame
+    || timeline.playheadFrame >= timeline.endFrameExclusive
+  ) {
+    timeline.playheadFrame = timeline.startFrame;
   }
-
+  syncVideoRangeSeconds(item);
+  videoPlaybackStartedAt = performance.now();
+  videoPlaybackStartSeconds = item.previewSeconds;
+  videoLastStaticPreviewAt = 0;
   stopVideoPlayback();
   videoPreviewPlaying = true;
-  updateVideoTimelineUi();
 
-  const stepSeconds = 0.25;
+  if (usingNativeVideoPreview(item) && previewVideoEl) {
+    previewVideoEl.currentTime = item.previewSeconds;
+    void previewVideoEl.play().catch((error) => {
+      setLog(`视频播放失败：${String(error)}`);
+      stopVideoPlayback();
+    });
+  }
+
+  updateVideoTimelineUi();
   videoPlaybackTimer = window.setInterval(() => {
     const activeItem = currentItem();
     if (!activeItem || state.mode !== "video") {
       stopVideoPlayback();
       return;
     }
-    const total = activeItem.lastProbe?.duration_seconds ?? 0;
-    const nextSeconds = Math.min((activeItem.previewSeconds ?? 0) + stepSeconds, total);
-    activeItem.previewSeconds = nextSeconds;
-    updateVideoTimelineUi();
-    void requestPreviewFrame(activeItem, "video", activeItem.previewSeconds);
-
-    if (nextSeconds >= total) {
+    const endSeconds = getVideoSegmentEnd(activeItem);
+    const nextSeconds = usingNativeVideoPreview(activeItem) && previewVideoEl
+      ? previewVideoEl.currentTime
+      : videoPlaybackStartSeconds + (performance.now() - videoPlaybackStartedAt) / 1000;
+    if (nextSeconds >= endSeconds) {
+      activeItem.videoTimeline.playheadFrame = activeItem.videoTimeline.endFrameExclusive - 1;
+      syncVideoRangeSeconds(activeItem);
+      if (usingNativeVideoPreview(activeItem) && previewVideoEl) {
+        previewVideoEl.currentTime = activeItem.previewSeconds;
+      } else {
+        void requestPreviewFrame(activeItem, "video", activeItem.previewSeconds);
+      }
       stopVideoPlayback();
       updateVideoTimelineUi();
+      return;
     }
-  }, 280);
+    activeItem.videoTimeline.playheadFrame = secondsToIndexedFrame(
+      nextSeconds,
+      activeItem.videoFrameIndex,
+    );
+    syncVideoRangeSeconds(activeItem);
+    updateVideoTimelineUi();
+    const now = performance.now();
+    if (!usingNativeVideoPreview(activeItem) && now - videoLastStaticPreviewAt >= 180) {
+      videoLastStaticPreviewAt = now;
+      void requestPreviewFrame(activeItem, "video", activeItem.previewSeconds);
+    }
+  }, 16);
 }
 
 function scheduleVideoPreviewRefresh(delay = 140) {
@@ -807,6 +1040,7 @@ function mediaTaskIds(item: QueueItem) {
     `preview-frame:${item.id}`,
     `thumbnail:${item.id}`,
     `preview-video:${item.id}`,
+    `frame-index:${item.id}`,
     `detect:${item.id}`,
     `export:${item.id}`,
   ];
@@ -1125,27 +1359,12 @@ function resizeRectByScale(mode = state.mode) {
 }
 
 function clampVideoSettings(mode = state.mode, item: QueueItem | null = currentItem(mode)) {
-  const duration = item?.lastProbe?.duration_seconds ?? 0;
-  if (duration > 0) {
-    if (!item) {
-      return;
-    }
-    const frameRate = getVideoFrameRate(item.lastProbe);
-    const totalFrames = getVideoFrameCount(item.lastProbe);
-    const requestedEnd = item.settings.videoStartSeconds + item.settings.videoDurationSeconds;
-    const startFrame = Math.min(
-      Math.max(0, totalFrames - 1),
-      secondsToFrame(item.settings.videoStartSeconds, frameRate, totalFrames),
-    );
-    const endFrame = Math.max(
-      startFrame + 1,
-      secondsToFrame(requestedEnd, frameRate, totalFrames),
-    );
-    const start = frameToSeconds(startFrame, frameRate, duration);
-    const end = frameToSeconds(Math.min(totalFrames, endFrame), frameRate, duration);
-    item.settings.videoStartSeconds = start;
-    item.settings.videoDurationSeconds = Math.max(0, end - start);
-  }
+  if (!item?.lastProbe || mode !== "video") return;
+  item.videoTimeline = normalizeVideoTimeline(
+    item.videoTimeline,
+    item.videoFrameIndex.frameCount,
+  );
+  syncVideoRangeSeconds(item);
 }
 
 function updateDurationInputs() {
@@ -1535,6 +1754,63 @@ async function runBlackBorderDetection(
   }
 }
 
+async function buildExactVideoFrameIndex(
+  item: QueueItem,
+  mode: MediaMode,
+  loadRevision: number,
+) {
+  if (!item.lastProbe?.variable_frame_rate) {
+    return;
+  }
+  item.videoFrameIndex.status = "indexing";
+  item.videoFrameIndex.warning = "";
+  if (mode === state.mode && currentItem(mode) === item) {
+    updateVideoTimelineUi();
+  }
+  const oldStart = item.settings.videoStartSeconds;
+  const oldEnd = getVideoSegmentEnd(item);
+  const oldPlayhead = item.previewSeconds;
+  try {
+    const result = await invoke<VideoFrameIndexResult>("build_video_frame_index", {
+      inputPath: item.inputPath,
+      durationSeconds: item.lastProbe.duration_seconds,
+      taskId: `frame-index:${item.id}`,
+    });
+    if (
+      item.loadRevision !== loadRevision
+      || !currentContext(mode).items.includes(item)
+    ) {
+      return;
+    }
+    item.videoFrameIndex = applyFrameBoundaries(
+      item.videoFrameIndex,
+      result.boundaries_seconds,
+      item.lastProbe.duration_seconds ?? 0,
+    );
+    const index = item.videoFrameIndex;
+    const playheadFrame = secondsToIndexedFrame(oldPlayhead, index);
+    const nextTimeline = createVideoTimelineState(index, playheadFrame);
+    nextTimeline.startFrame = secondsToIndexedFrame(oldStart, index);
+    nextTimeline.endFrameExclusive = oldEnd >= (item.lastProbe.duration_seconds ?? oldEnd)
+      ? index.frameCount
+      : Math.min(index.frameCount, secondsToIndexedFrame(Math.max(0, oldEnd - 0.000_001), index) + 1);
+    item.videoTimeline = normalizeVideoTimeline(nextTimeline, index.frameCount);
+    syncVideoRangeSeconds(item);
+  } catch (error) {
+    if (
+      item.loadRevision !== loadRevision
+      || !currentContext(mode).items.includes(item)
+    ) {
+      return;
+    }
+    item.videoFrameIndex.status = "approximate";
+    item.videoFrameIndex.warning = `帧索引失败，当前仅能近似到帧：${String(error)}`;
+  }
+  if (mode === state.mode && currentItem(mode) === item) {
+    updateVideoTimelineUi();
+  }
+}
+
 async function autoProbeMedia(item: QueueItem, mode: MediaMode) {
   const context = currentContext(mode);
   if (!item?.inputPath) {
@@ -1563,16 +1839,22 @@ async function autoProbeMedia(item: QueueItem, mode: MediaMode) {
     }
 
     item.lastProbe = result;
+    if (mode === "video") {
+      item.videoFrameIndex = createVideoFrameIndex(result);
+      item.videoTimeline = createVideoTimelineState(item.videoFrameIndex);
+    }
     clampVideoSettings(mode, item);
     item.settings.rect = null;
     context.log = "媒体信息读取成功，可以直接拖拽裁剪框或调整参数。";
     ensureRect(mode, item);
     if (mode === "video") {
       const totalDuration = Math.max(0, result.duration_seconds ?? item.settings.videoDurationSeconds);
+      item.videoTimeline = createVideoTimelineState(item.videoFrameIndex);
       item.settings.videoStartSeconds = 0;
       item.settings.videoDurationSeconds = totalDuration;
       item.previewSeconds = 0;
       clampVideoSettings(mode, item);
+      void buildExactVideoFrameIndex(item, mode, loadRevision);
       if (autoDetectBlackBordersEl?.checked ?? false) {
         await runBlackBorderDetection([item], mode, true);
         if (item.loadRevision !== loadRevision || !context.items.includes(item)) {
@@ -2248,36 +2530,6 @@ window.addEventListener("DOMContentLoaded", () => {
       item.settings.imageFormat = getImageFormatExtension();
     }
   });
-  videoPreviewSeekEl?.addEventListener("input", () => {
-    const item = currentItem();
-    if (!item) {
-      return;
-    }
-    stopVideoPlayback();
-    item.previewSeconds = frameToSeconds(
-      Number(videoPreviewSeekEl.value || 0),
-      getVideoFrameRate(item.lastProbe),
-      item.lastProbe?.duration_seconds,
-    );
-    updateVideoTimelineUi();
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    scheduleVideoPreviewRefresh();
-  });
-  videoPreviewSeekEl?.addEventListener("change", () => {
-    const item = currentItem();
-    if (!item || state.mode !== "video") {
-      return;
-    }
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    cancelScheduledVideoPreview();
-    void requestPreviewFrame(item, "video", item.previewSeconds);
-  });
   videoPreviewToggleEl?.addEventListener("click", () => {
     const item = currentItem();
     if (!item || state.mode !== "video") {
@@ -2291,85 +2543,201 @@ window.addEventListener("DOMContentLoaded", () => {
     }
     startVideoPlayback();
   });
-  videoExportStartEl?.addEventListener("input", () => {
+
+  type TimelineRole = "start" | "end" | "playhead";
+  let activeTimelineDrag: {
+    role: TimelineRole | "viewport";
+    detail: boolean;
+    startClientX: number;
+    initialViewStart: number;
+  } | null = null;
+
+  const timelineFrameAtPointer = (
+    track: HTMLElement,
+    clientX: number,
+    detail: boolean,
+    role: TimelineRole,
+  ) => {
     const item = currentItem();
-    const duration = item?.lastProbe?.duration_seconds ?? 0;
-    if (!item || state.mode !== "video" || duration <= 0) {
-      return;
-    }
-    stopVideoPlayback();
-    const frameRate = getVideoFrameRate(item.lastProbe);
-    const totalFrames = getVideoFrameCount(item.lastProbe);
-    const currentEndFrame = secondsToFrame(getVideoSegmentEnd(item), frameRate, totalFrames);
-    const nextStartFrame = Math.min(
-      Number(videoExportStartEl.value || 0),
-      Math.max(0, currentEndFrame - 1),
+    if (!item) return 0;
+    const rect = track.getBoundingClientRect();
+    const start = detail ? item.videoTimeline.viewStartFrame : 0;
+    const end = detail
+      ? item.videoTimeline.viewEndFrameExclusive
+      : item.videoFrameIndex.frameCount;
+    return frameFromTrackPosition(
+      clientX,
+      rect.left,
+      rect.width,
+      start,
+      end,
+      role === "end",
     );
-    const nextStart = frameToSeconds(nextStartFrame, frameRate, duration);
-    const end = frameToSeconds(currentEndFrame, frameRate, duration);
-    item.settings.videoStartSeconds = nextStart;
-    item.settings.videoDurationSeconds = Math.max(0, end - nextStart);
-    item.previewSeconds = nextStart;
-    clampVideoSettings();
-    invalidateDetectionForSegmentChange(item);
-    updateVideoTimelineUi();
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    scheduleVideoPreviewRefresh();
-  });
-  videoExportEndEl?.addEventListener("input", () => {
+  };
+
+  const beginTimelineDrag = (event: PointerEvent, detail: boolean) => {
     const item = currentItem();
-    const duration = item?.lastProbe?.duration_seconds ?? 0;
-    if (!item || state.mode !== "video" || duration <= 0) {
+    const track = detail ? videoDetailTrackEl : videoOverviewTrackEl;
+    if (!item || !track || state.mode !== "video") return;
+    const target = event.target as HTMLElement;
+    if (!detail && target === videoOverviewWindowEl) {
+      activeTimelineDrag = {
+        role: "viewport",
+        detail,
+        startClientX: event.clientX,
+        initialViewStart: item.videoTimeline.viewStartFrame,
+      };
+      event.preventDefault();
       return;
     }
-    stopVideoPlayback();
-    const frameRate = getVideoFrameRate(item.lastProbe);
-    const totalFrames = getVideoFrameCount(item.lastProbe);
-    const startFrame = secondsToFrame(item.settings.videoStartSeconds, frameRate, totalFrames);
-    const nextEndFrame = Math.min(
-      totalFrames,
-      Math.max(Number(videoExportEndEl.value || 0), startFrame + 1),
+    const role = (target.closest<HTMLElement>("[data-timeline-role]")
+      ?.dataset.timelineRole ?? "playhead") as TimelineRole;
+    activeTimelineDrag = {
+      role,
+      detail,
+      startClientX: event.clientX,
+      initialViewStart: item.videoTimeline.viewStartFrame,
+    };
+    setTimelineRoleFrame(
+      item,
+      role,
+      timelineFrameAtPointer(track, event.clientX, detail, role),
+      !detail,
     );
-    const start = frameToSeconds(startFrame, frameRate, duration);
-    const nextEnd = frameToSeconds(nextEndFrame, frameRate, duration);
-    item.settings.videoDurationSeconds = Math.max(0, nextEnd - start);
-    item.previewSeconds = Math.min(duration, nextEnd);
-    clampVideoSettings();
-    invalidateDetectionForSegmentChange(item);
+    event.preventDefault();
+  };
+
+  videoOverviewTrackEl?.addEventListener("pointerdown", (event) => {
+    beginTimelineDrag(event, false);
+  });
+  videoDetailTrackEl?.addEventListener("pointerdown", (event) => {
+    beginTimelineDrag(event, true);
+  });
+  window.addEventListener("pointermove", (event) => {
+    const item = currentItem();
+    if (!activeTimelineDrag || !item || state.mode !== "video") return;
+    const track = activeTimelineDrag.detail ? videoDetailTrackEl : videoOverviewTrackEl;
+    if (!track) return;
+    if (activeTimelineDrag.role === "viewport") {
+      const rect = track.getBoundingClientRect();
+      const delta = rect.width > 0
+        ? (event.clientX - activeTimelineDrag.startClientX) / rect.width
+          * item.videoFrameIndex.frameCount
+        : 0;
+      const timeline = item.videoTimeline;
+      const span = timeline.viewEndFrameExclusive - timeline.viewStartFrame;
+      const nextStart = Math.max(
+        0,
+        Math.min(
+          item.videoFrameIndex.frameCount - span,
+          activeTimelineDrag.initialViewStart + Math.round(delta),
+        ),
+      );
+      timeline.viewStartFrame = nextStart;
+      timeline.viewEndFrameExclusive = nextStart + span;
+      updateVideoTimelineUi();
+    } else {
+      setTimelineRoleFrame(
+        item,
+        activeTimelineDrag.role,
+        timelineFrameAtPointer(
+          track,
+          event.clientX,
+          activeTimelineDrag.detail,
+          activeTimelineDrag.role,
+        ),
+        !activeTimelineDrag.detail,
+      );
+    }
+  });
+  window.addEventListener("pointerup", () => {
+    const item = currentItem();
+    if (
+      activeTimelineDrag
+      && activeTimelineDrag.role !== "viewport"
+      && item
+      && !usingNativeVideoPreview(item)
+    ) {
+      previewTimelineFrame(item, item.videoTimeline.playheadFrame, true);
+    }
+    activeTimelineDrag = null;
+  });
+
+  const bindTimelineKeyboard = (
+    element: HTMLButtonElement | null,
+    role: TimelineRole,
+  ) => {
+    element?.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const item = currentItem();
+      if (!item || state.mode !== "video") return;
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const step = event.shiftKey ? 10 : 1;
+      const current = role === "start"
+        ? item.videoTimeline.startFrame
+        : role === "end"
+          ? item.videoTimeline.endFrameExclusive
+          : item.videoTimeline.playheadFrame;
+      setTimelineRoleFrame(item, role, current + direction * step, true);
+      event.preventDefault();
+    });
+  };
+  bindTimelineKeyboard(videoOverviewStartEl, "start");
+  bindTimelineKeyboard(videoOverviewEndEl, "end");
+  bindTimelineKeyboard(videoOverviewPlayheadEl, "playhead");
+  bindTimelineKeyboard(videoDetailStartEl, "start");
+  bindTimelineKeyboard(videoDetailEndEl, "end");
+  bindTimelineKeyboard(videoDetailPlayheadEl, "playhead");
+
+  timelineZoomInEl?.addEventListener("click", () => {
+    const item = currentItem();
+    if (!item) return;
+    item.videoTimeline = zoomTimelineView(
+      item.videoTimeline,
+      item.videoFrameIndex.frameCount,
+      0.5,
+    );
     updateVideoTimelineUi();
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    scheduleVideoPreviewRefresh();
   });
-  videoExportStartEl?.addEventListener("change", () => {
+  timelineZoomOutEl?.addEventListener("click", () => {
     const item = currentItem();
-    if (!item || state.mode !== "video") {
-      return;
-    }
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    cancelScheduledVideoPreview();
-    void requestPreviewFrame(item, "video", item.previewSeconds);
+    if (!item) return;
+    item.videoTimeline = zoomTimelineView(
+      item.videoTimeline,
+      item.videoFrameIndex.frameCount,
+      2,
+    );
+    updateVideoTimelineUi();
   });
-  videoExportEndEl?.addEventListener("change", () => {
+  timelineFitSelectionEl?.addEventListener("click", () => {
     const item = currentItem();
-    if (!item || state.mode !== "video") {
-      return;
-    }
-    if (usingNativeVideoPreview(item) && previewVideoEl) {
-      previewVideoEl.currentTime = item.previewSeconds;
-      return;
-    }
-    cancelScheduledVideoPreview();
-    void requestPreviewFrame(item, "video", item.previewSeconds);
+    if (item) fitTimelineSelection(item);
   });
+  const panByVisibleFraction = (direction: number) => {
+    const item = currentItem();
+    if (!item) return;
+    const span = item.videoTimeline.viewEndFrameExclusive - item.videoTimeline.viewStartFrame;
+    panTimelineView(item, Math.max(1, Math.round(span * 0.6)) * direction);
+  };
+  timelinePanLeftEl?.addEventListener("click", () => panByVisibleFraction(-1));
+  timelinePanRightEl?.addEventListener("click", () => panByVisibleFraction(1));
+  videoDetailTrackEl?.addEventListener("wheel", (event) => {
+    const item = currentItem();
+    if (!item) return;
+    if (event.ctrlKey || event.metaKey) {
+      item.videoTimeline = zoomTimelineView(
+        item.videoTimeline,
+        item.videoFrameIndex.frameCount,
+        event.deltaY > 0 ? 1.5 : 2 / 3,
+      );
+      updateVideoTimelineUi();
+    } else {
+      const span = item.videoTimeline.viewEndFrameExclusive - item.videoTimeline.viewStartFrame;
+      panTimelineView(item, Math.round((event.deltaX || event.deltaY) / 120 * span * 0.15));
+    }
+    event.preventDefault();
+  }, { passive: false });
+
   previewVideoEl?.addEventListener("loadedmetadata", () => {
     const item = currentItem();
     if (!item || !usingNativeVideoPreview(item) || !previewVideoEl) {
@@ -2386,7 +2754,17 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!item || !usingNativeVideoPreview(item) || !previewVideoEl) {
       return;
     }
-    item.previewSeconds = previewVideoEl.currentTime;
+    const nextFrame = secondsToIndexedFrame(
+      previewVideoEl.currentTime,
+      item.videoFrameIndex,
+    );
+    item.videoTimeline.playheadFrame = videoPreviewPlaying
+      ? Math.max(
+          item.videoTimeline.startFrame,
+          Math.min(item.videoTimeline.endFrameExclusive - 1, nextFrame),
+        )
+      : nextFrame;
+    syncVideoRangeSeconds(item);
     updateVideoTimelineUi();
   });
   previewVideoEl?.addEventListener("play", () => {
@@ -2407,7 +2785,8 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
     void releasePreviewAsset(item);
-    item.previewSeconds = item.settings.videoStartSeconds;
+    item.videoTimeline.playheadFrame = item.videoTimeline.startFrame;
+    syncVideoRangeSeconds(item);
     setLog("当前视频无法在预览区原生播放，已回退为静态帧预览。");
     void requestPreviewFrame(item, "video", item.previewSeconds);
   });
@@ -2445,6 +2824,25 @@ window.addEventListener("DOMContentLoaded", () => {
       item.settings.imageQuality = source.settings.imageQuality;
       item.settings.videoStartSeconds = source.settings.videoStartSeconds;
       item.settings.videoDurationSeconds = source.settings.videoDurationSeconds;
+      if (state.mode === "video" && item.lastProbe) {
+        const targetEnd = source.settings.videoStartSeconds + source.settings.videoDurationSeconds;
+        item.videoTimeline.startFrame = secondsToIndexedFrame(
+          source.settings.videoStartSeconds,
+          item.videoFrameIndex,
+        );
+        item.videoTimeline.endFrameExclusive = Math.min(
+          item.videoFrameIndex.frameCount,
+          secondsToIndexedFrame(Math.max(0, targetEnd - 0.000_001), item.videoFrameIndex) + 1,
+        );
+        item.videoTimeline.playheadFrame = item.videoTimeline.startFrame;
+        item.videoTimeline = centerTimelineView(
+          item.videoTimeline,
+          item.videoTimeline.startFrame,
+          item.videoFrameIndex.frameCount,
+        );
+        clampVideoSettings("video", item);
+        invalidateDetectionForSegmentChange(item);
+      }
 
       const targetBounds = getItemCropBounds(item, state.mode);
       if (!targetBounds.width || !targetBounds.height) {

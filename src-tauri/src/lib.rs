@@ -59,9 +59,18 @@ struct ProbeResult {
     display_height: Option<u64>,
     duration_seconds: Option<f64>,
     frame_rate: Option<f64>,
+    frame_rate_numerator: Option<u64>,
+    frame_rate_denominator: Option<u64>,
     frame_count: Option<u64>,
+    variable_frame_rate: bool,
     bit_rate: Option<u64>,
     raw: Value,
+}
+
+#[derive(Serialize)]
+struct VideoFrameIndexResult {
+    frame_count: usize,
+    boundaries_seconds: Vec<f64>,
 }
 
 #[derive(Serialize)]
@@ -419,6 +428,14 @@ fn parse_frame_rate(value: Option<&Value>) -> Option<f64> {
     (rate.is_finite() && rate > 0.0 && rate <= 1000.0).then_some(rate)
 }
 
+fn parse_frame_rate_ratio(value: Option<&Value>) -> Option<(u64, u64)> {
+    let text = parse_number_string(value)?;
+    let (numerator, denominator) = text.split_once('/')?;
+    let numerator = numerator.parse::<u64>().ok()?;
+    let denominator = denominator.parse::<u64>().ok()?;
+    (numerator > 0 && denominator > 0 && numerator <= 1_000_000).then_some((numerator, denominator))
+}
+
 fn normalize_rotation_degrees(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -770,10 +787,20 @@ fn probe_result_from_raw(raw: Value) -> ProbeResult {
     let codec_name = video_stream
         .and_then(|stream| stream["codec_name"].as_str())
         .map(str::to_string);
-    let frame_rate = video_stream.and_then(|stream| {
-        parse_frame_rate(stream.get("avg_frame_rate"))
-            .or_else(|| parse_frame_rate(stream.get("r_frame_rate")))
-    });
+    let average_frame_rate =
+        video_stream.and_then(|stream| parse_frame_rate(stream.get("avg_frame_rate")));
+    let real_frame_rate =
+        video_stream.and_then(|stream| parse_frame_rate(stream.get("r_frame_rate")));
+    let frame_rate = average_frame_rate.or(real_frame_rate);
+    let frame_rate_ratio = video_stream
+        .and_then(|stream| parse_frame_rate_ratio(stream.get("avg_frame_rate")))
+        .or_else(|| {
+            video_stream.and_then(|stream| parse_frame_rate_ratio(stream.get("r_frame_rate")))
+        });
+    let variable_frame_rate = match (average_frame_rate, real_frame_rate) {
+        (Some(average), Some(real)) => (average - real).abs() > 0.001,
+        _ => false,
+    };
     let frame_count = video_stream
         .and_then(|stream| parse_optional_u64(stream.get("nb_frames")))
         .or_else(|| {
@@ -793,7 +820,10 @@ fn probe_result_from_raw(raw: Value) -> ProbeResult {
         display_height,
         duration_seconds,
         frame_rate,
+        frame_rate_numerator: frame_rate_ratio.map(|ratio| ratio.0),
+        frame_rate_denominator: frame_rate_ratio.map(|ratio| ratio.1),
         frame_count,
+        variable_frame_rate,
         bit_rate,
         raw,
     }
@@ -843,6 +873,109 @@ fn probe_media(
     probe_media_inner(input_path, Some(&manager), task_id.as_deref())
 }
 
+fn normalize_frame_boundaries(raw: &Value, duration_seconds: Option<f64>) -> Vec<f64> {
+    let frames = raw["frames"].as_array().cloned().unwrap_or_default();
+    let last_frame_duration = frames
+        .last()
+        .and_then(|frame| parse_optional_f64(frame.get("pkt_duration_time")))
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let mut starts = frames
+        .iter()
+        .filter_map(|frame| parse_optional_f64(frame.get("best_effort_timestamp_time")))
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if starts.is_empty() {
+        return Vec::new();
+    }
+    starts.sort_by(|left, right| left.total_cmp(right));
+    let origin = starts[0];
+    let mut boundaries = Vec::with_capacity(starts.len() + 1);
+    for value in starts {
+        let normalized = (value - origin).max(0.0);
+        if boundaries
+            .last()
+            .is_none_or(|previous| normalized > *previous)
+        {
+            boundaries.push(normalized);
+        }
+    }
+    if boundaries.is_empty() {
+        return Vec::new();
+    }
+    let fallback_step = boundaries
+        .windows(2)
+        .last()
+        .map(|pair| pair[1] - pair[0])
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0 / 30.0);
+    let source_duration = duration_seconds.filter(|value| value.is_finite() && *value > 0.0);
+    let inferred_end =
+        boundaries[boundaries.len() - 1] + last_frame_duration.unwrap_or(fallback_step);
+    let final_boundary = source_duration
+        .filter(|duration| (*duration - inferred_end).abs() <= fallback_step * 2.0)
+        .unwrap_or(inferred_end)
+        .max(boundaries[boundaries.len() - 1] + f64::EPSILON);
+    boundaries.push(final_boundary);
+    boundaries
+}
+
+fn build_video_frame_index_inner(
+    input_path: String,
+    duration_seconds: Option<f64>,
+    manager: Option<&MediaTaskManager>,
+    task_id: Option<&str>,
+) -> Result<VideoFrameIndexResult, String> {
+    let input = Path::new(&input_path);
+    if !input.is_file() {
+        return Err("输入媒体不存在或不是普通文件".to_string());
+    }
+    let output = run_command_output(
+        Command::new(find_ffprobe()).args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp_time,pkt_duration_time",
+            "-print_format",
+            "json",
+            &input_path,
+        ]),
+        manager,
+        task_id,
+    )
+    .map_err(|error| format!("ffprobe 帧索引启动失败: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let raw: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("ffprobe 帧索引解析失败: {error}"))?;
+    let boundaries_seconds = normalize_frame_boundaries(&raw, duration_seconds);
+    if boundaries_seconds.len() < 2 {
+        return Err("没有读取到有效的视频帧时间戳".to_string());
+    }
+    Ok(VideoFrameIndexResult {
+        frame_count: boundaries_seconds.len() - 1,
+        boundaries_seconds,
+    })
+}
+
+#[tauri::command(async)]
+fn build_video_frame_index(
+    manager: tauri::State<'_, MediaTaskManager>,
+    input_path: String,
+    duration_seconds: Option<f64>,
+    task_id: Option<String>,
+) -> Result<VideoFrameIndexResult, String> {
+    build_video_frame_index_inner(
+        input_path,
+        duration_seconds,
+        Some(&manager),
+        task_id.as_deref(),
+    )
+}
+
 fn build_preview_data_url_inner(
     input_path: String,
     preview_time_seconds: Option<f64>,
@@ -860,7 +993,7 @@ fn build_preview_data_url_inner(
 
     if let Some(seconds) = preview_time_seconds {
         if seconds.is_finite() && seconds > 0.0 {
-            args.extend(["-ss".to_string(), format!("{seconds:.3}")]);
+            args.extend(["-ss".to_string(), format!("{seconds:.9}")]);
         }
     }
 
@@ -1610,10 +1743,10 @@ fn export_media_inner(
     if request.mode == "video" {
         args.extend([
             "-ss".to_string(),
-            format!("{:.6}", request.video_start_seconds.unwrap_or(0.0).max(0.0)),
+            format!("{:.9}", request.video_start_seconds.unwrap_or(0.0).max(0.0)),
             "-t".to_string(),
             format!(
-                "{:.6}",
+                "{:.9}",
                 request.video_duration_seconds.unwrap_or(5.0).max(0.000_001)
             ),
         ]);
@@ -1857,6 +1990,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_media,
+            build_video_frame_index,
             build_preview_data_url,
             build_preview_video_asset,
             delete_preview_asset,
@@ -1879,12 +2013,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_data_url_inner, detect_black_borders_inner, detection_confidence,
-        export_media_inner, find_ffmpeg, generate_preview_video_asset,
-        is_direct_preview_compatible, is_managed_preview_asset, parse_bbox_metadata,
-        parse_frame_rate, parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
-        representative_rect_for_window, suffixed_output_path, CropRect, CropRectRequest,
-        DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
+        build_preview_data_url_inner, build_video_frame_index_inner, detect_black_borders_inner,
+        detection_confidence, export_media_inner, find_ffmpeg, generate_preview_video_asset,
+        is_direct_preview_compatible, is_managed_preview_asset, normalize_frame_boundaries,
+        parse_bbox_metadata, parse_frame_rate, parse_frame_rate_ratio, parse_rotation_degrees,
+        probe_media_inner, probe_result_from_raw, representative_rect_for_window,
+        suffixed_output_path, CropRect, CropRectRequest, DetectBlackBordersRequest,
+        ExportMediaRequest, ProbeResult,
     };
     use serde_json::json;
     use std::env;
@@ -1930,6 +2065,41 @@ mod tests {
             .expect("ffmpeg should be callable during tests");
 
         assert!(status.success(), "sample video generation should succeed");
+    }
+
+    fn create_sample_vfr_video(output_path: &Path) {
+        let status = Command::new(find_ffmpeg())
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=24:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=30:duration=1",
+                "-filter_complex",
+                "[0:v]setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0,settb=1/60000[v]",
+                "-map",
+                "[v]",
+                "-fps_mode",
+                "vfr",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "5",
+                "-pix_fmt",
+                "yuv420p",
+                output_path.to_str().expect("utf-8 path"),
+            ])
+            .status()
+            .expect("ffmpeg should generate a VFR sample during tests");
+
+        assert!(status.success(), "VFR sample generation should succeed");
     }
 
     fn create_sample_image(output_path: &Path) {
@@ -2017,7 +2187,10 @@ mod tests {
         assert_eq!(result.display_height, Some(240));
         assert!(result.duration_seconds.unwrap_or_default() > 0.0);
         assert!((result.frame_rate.unwrap_or_default() - 30.0).abs() < 0.01);
+        assert_eq!(result.frame_rate_numerator, Some(30));
+        assert_eq!(result.frame_rate_denominator, Some(1));
         assert_eq!(result.frame_count, Some(60));
+        assert!(!result.variable_frame_rate);
 
         let _ = fs::remove_file(input_path);
     }
@@ -2055,6 +2228,52 @@ mod tests {
         let ntsc = parse_frame_rate(Some(&json!("30000/1001"))).expect("valid NTSC rate");
         assert!((ntsc - 29.970_029_97).abs() < 0.000_001);
         assert_eq!(parse_frame_rate(Some(&json!("0/0"))), None);
+        assert_eq!(
+            parse_frame_rate_ratio(Some(&json!("30000/1001"))),
+            Some((30000, 1001))
+        );
+    }
+
+    #[test]
+    fn frame_boundaries_are_normalized_and_get_an_exclusive_end() {
+        let raw = json!({
+            "frames": [
+                { "best_effort_timestamp_time": "5.000" },
+                { "best_effort_timestamp_time": "5.033" },
+                { "best_effort_timestamp_time": "5.067" },
+                { "best_effort_timestamp_time": "5.067" }
+            ]
+        });
+        let boundaries = normalize_frame_boundaries(&raw, Some(0.1));
+        assert_eq!(boundaries.len(), 4);
+        assert_eq!(boundaries[0], 0.0);
+        assert!((boundaries[1] - 0.033).abs() < 0.000_001);
+        assert!(boundaries[3] >= 0.1);
+    }
+
+    #[test]
+    fn frame_index_reads_real_vfr_boundaries() {
+        let input_path = unique_path("frame-index-vfr.mp4");
+        create_sample_vfr_video(&input_path);
+        let probe = probe_media_inner(input_path.to_string_lossy().to_string(), None, None)
+            .expect("VFR probe should succeed");
+        assert!(probe.variable_frame_rate);
+        let result = build_video_frame_index_inner(
+            input_path.to_string_lossy().to_string(),
+            Some(2.0),
+            None,
+            None,
+        )
+        .expect("VFR frame index should succeed");
+
+        assert_eq!(result.frame_count, 54);
+        assert_eq!(result.boundaries_seconds.len(), 55);
+        assert!(result
+            .boundaries_seconds
+            .windows(2)
+            .all(|pair| pair[1] > pair[0]));
+
+        let _ = fs::remove_file(input_path);
     }
 
     #[test]
@@ -2186,7 +2405,10 @@ lavfi.bbox.h=164
             display_height: Some(1080),
             duration_seconds: Some(5.0),
             frame_rate: Some(30.0),
+            frame_rate_numerator: Some(30),
+            frame_rate_denominator: Some(1),
             frame_count: Some(150),
+            variable_frame_rate: false,
             bit_rate: None,
             raw: json!({}),
         };
@@ -2344,6 +2566,57 @@ lavfi.bbox.h=164
         assert_eq!(result.output_path, output_path.to_string_lossy());
         assert_eq!(result.applied_filter, "crop=240:240:40:0");
         assert!(output_path.exists(), "output file should exist");
+        let output_probe = probe_media_inner(output_path.to_string_lossy().to_string(), None, None)
+            .expect("exported video should be probeable");
+        assert_eq!(output_probe.frame_count, Some(30));
+
+        let _ = fs::remove_file(input_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn export_vfr_range_uses_exact_frame_boundaries() {
+        let input_path = unique_path("export-vfr-input.mp4");
+        let output_path = unique_path("export-vfr-output.mp4");
+        create_sample_vfr_video(&input_path);
+        let index = build_video_frame_index_inner(
+            input_path.to_string_lossy().to_string(),
+            Some(2.0),
+            None,
+            None,
+        )
+        .expect("VFR index should succeed");
+        let start = index.boundaries_seconds[24];
+        let end = index.boundaries_seconds[29];
+
+        export_media_inner(
+            ExportMediaRequest {
+                task_id: None,
+                input_path: input_path.to_string_lossy().to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                avoid_overwrite: false,
+                mode: "video".to_string(),
+                ratio: "free".to_string(),
+                anchor: "center".to_string(),
+                scale: 1.0,
+                image_format: None,
+                image_quality: None,
+                video_start_seconds: Some(start),
+                video_duration_seconds: Some(end - start),
+                crop_rect: Some(CropRectRequest {
+                    x: 0,
+                    y: 0,
+                    width: 160,
+                    height: 120,
+                }),
+            },
+            None,
+            None,
+        )
+        .expect("VFR range export should succeed");
+        let output_probe = probe_media_inner(output_path.to_string_lossy().to_string(), None, None)
+            .expect("VFR export should be probeable");
+        assert_eq!(output_probe.frame_count, Some(5));
 
         let _ = fs::remove_file(input_path);
         let _ = fs::remove_file(output_path);

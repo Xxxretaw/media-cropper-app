@@ -1321,6 +1321,21 @@ fn minimum_margin(samples: &[BorderMargins], cluster: &[usize]) -> Option<Border
     Some(result)
 }
 
+fn inset_detected_margins(
+    margins: BorderMargins,
+    source_width: u64,
+    source_height: u64,
+) -> BorderMargins {
+    let horizontal_inset = ((source_width as f64 * 0.002).round() as u64).clamp(2, 4);
+    let vertical_inset = ((source_height as f64 * 0.002).round() as u64).clamp(2, 4);
+    BorderMargins {
+        left: margins.left.saturating_add(horizontal_inset),
+        top: margins.top.saturating_add(vertical_inset),
+        right: margins.right.saturating_add(horizontal_inset),
+        bottom: margins.bottom.saturating_add(vertical_inset),
+    }
+}
+
 fn parse_bbox_metadata(output: &str, source_width: u64, source_height: u64) -> Vec<CropRect> {
     let mut rects = Vec::new();
     let mut x = None;
@@ -1649,18 +1664,13 @@ fn detect_black_borders_inner(
         });
     }
 
-    let horizontal_safety = ((source_width as f64 * 0.002).round() as u64).clamp(2, 4);
-    let vertical_safety = ((source_height as f64 * 0.002).round() as u64).clamp(2, 4);
-    let safe_margins = BorderMargins {
-        left: consensus.left.saturating_sub(horizontal_safety),
-        top: consensus.top.saturating_sub(vertical_safety),
-        right: consensus.right.saturating_sub(horizontal_safety),
-        bottom: consensus.bottom.saturating_sub(vertical_safety),
-    };
-    let safe_rect = rect_from_margins(safe_margins, source_width, source_height)
+    // Crop slightly inside the detected content boundary. Losing a few pixels
+    // of visible content is preferable to leaving any residual black edge.
+    let inset_margins = inset_detected_margins(consensus, source_width, source_height);
+    let inset_rect = rect_from_margins(inset_margins, source_width, source_height)
         .ok_or_else(|| "检测到的内容区域无效".to_string())?;
     let normalized = normalize_crop_rect(
-        &crop_rect_to_request(safe_rect),
+        &crop_rect_to_request(inset_rect),
         source_width,
         source_height,
         true,
@@ -2015,11 +2025,11 @@ mod tests {
     use super::{
         build_preview_data_url_inner, build_video_frame_index_inner, detect_black_borders_inner,
         detection_confidence, export_media_inner, find_ffmpeg, generate_preview_video_asset,
-        is_direct_preview_compatible, is_managed_preview_asset, normalize_frame_boundaries,
-        parse_bbox_metadata, parse_frame_rate, parse_frame_rate_ratio, parse_rotation_degrees,
-        probe_media_inner, probe_result_from_raw, representative_rect_for_window,
-        suffixed_output_path, CropRect, CropRectRequest, DetectBlackBordersRequest,
-        ExportMediaRequest, ProbeResult,
+        inset_detected_margins, is_direct_preview_compatible, is_managed_preview_asset,
+        normalize_frame_boundaries, parse_bbox_metadata, parse_frame_rate, parse_frame_rate_ratio,
+        parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
+        representative_rect_for_window, suffixed_output_path, BorderMargins, CropRect,
+        CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
     };
     use serde_json::json;
     use std::env;
@@ -2348,6 +2358,44 @@ lavfi.bbox.h=164
         let confidence = detection_confidence(3, 7);
         assert!((confidence - (3.0 / 7.0)).abs() < f64::EPSILON);
         assert!(confidence < 0.7);
+    }
+
+    #[test]
+    fn detected_margins_crop_two_to_four_pixels_inside_content() {
+        let margins = BorderMargins {
+            left: 100,
+            top: 100,
+            right: 100,
+            bottom: 100,
+        };
+
+        assert_eq!(
+            inset_detected_margins(margins, 640, 360),
+            BorderMargins {
+                left: 102,
+                top: 102,
+                right: 102,
+                bottom: 102,
+            }
+        );
+        assert_eq!(
+            inset_detected_margins(margins, 1920, 1080),
+            BorderMargins {
+                left: 104,
+                top: 102,
+                right: 104,
+                bottom: 102,
+            }
+        );
+        assert_eq!(
+            inset_detected_margins(margins, 3840, 2160),
+            BorderMargins {
+                left: 104,
+                top: 104,
+                right: 104,
+                bottom: 104,
+            }
+        );
     }
 
     #[test]

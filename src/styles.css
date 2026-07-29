@@ -798,30 +798,46 @@ button:disabled,
 
 .timeline-handle {
   z-index: 4;
-  width: 14px;
-  min-width: 14px;
-  height: 20px;
-  min-height: 20px;
+  width: 11px;
+  min-width: 11px;
+  height: 18px;
+  min-height: 18px;
   border: 2px solid var(--accent-light);
-  border-radius: 5px;
+  border-radius: 4px;
   background: var(--range-thumb-bg);
   box-shadow: 0 2px 8px var(--shadow-thumb);
 }
 
 .timeline-fine-track .timeline-handle {
+  width: 14px;
+  min-width: 14px;
   height: 28px;
   min-height: 28px;
 }
 
 .timeline-playhead {
-  width: 3px;
-  min-width: 3px;
+  z-index: 5;
+  width: 5px;
+  min-width: 5px;
   height: 26px;
   min-height: 26px;
   border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.timeline-playhead::before {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 3px;
+  height: 100%;
   border-radius: 999px;
+  content: "";
   background: var(--text-active);
   box-shadow: 0 0 0 1px var(--accent), 0 2px 7px var(--shadow-thumb);
+  transform: translateX(-50%);
+  pointer-events: none;
 }
 
 .timeline-handle:focus-visible,
@@ -1071,6 +1087,8 @@ h2 {
 }
 
 .detection-actions {
+  width: 100%;
+  min-width: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
@@ -1079,6 +1097,7 @@ h2 {
 .detection-actions button {
   min-width: 0;
   padding: 8px 10px;
+  white-space: nowrap;
 }
 
 .detection-result-action {
@@ -1090,8 +1109,10 @@ h2 {
 }
 
 #video-range-summary {
+  min-width: 0;
   line-height: 1.45;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1345,6 +1366,8 @@ input[type="range"] {
 }
 
 .advanced-section {
+  width: 100%;
+  min-width: 0;
   display: block;
   padding-bottom: 0;
   overflow: hidden;
@@ -1394,6 +1417,7 @@ input[type="range"] {
 }
 
 .advanced-section-body {
+  min-width: 0;
   display: grid;
   gap: 12px;
   padding: 3px 10px 11px;

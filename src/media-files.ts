@@ -5,6 +5,11 @@ export const MEDIA_EXTENSIONS: Record<MediaMode, readonly string[]> = {
   video: ["mp4", "mov", "m4v", "mkv", "avi"],
 };
 
+export const ALL_MEDIA_EXTENSIONS = [
+  ...MEDIA_EXTENSIONS.image,
+  ...MEDIA_EXTENSIONS.video,
+];
+
 export type RoutedMediaFile = {
   mode: MediaMode;
   path: string;

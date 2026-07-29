@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ALL_MEDIA_EXTENSIONS,
   getFileStem,
   mediaModeFromPath,
   routeMediaPaths,
 } from "../src/media-files.ts";
+
+test("the unified picker accepts every supported image and video extension", () => {
+  assert.deepEqual(ALL_MEDIA_EXTENSIONS, [
+    "jpg", "jpeg", "png", "bmp", "tif", "tiff",
+    "mp4", "mov", "m4v", "mkv", "avi",
+  ]);
+});
 
 test("media paths are classified case-insensitively", () => {
   assert.equal(mediaModeFromPath("/tmp/photo.JPEG"), "image");

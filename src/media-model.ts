@@ -13,9 +13,35 @@ export type ProbeResult = {
   display_height?: number;
   duration_seconds?: number;
   frame_rate?: number;
+  frame_rate_numerator?: number;
+  frame_rate_denominator?: number;
   frame_count?: number;
+  variable_frame_rate?: boolean;
   bit_rate?: number;
   raw: unknown;
+};
+
+export type VideoFrameIndexResult = {
+  frame_count: number;
+  boundaries_seconds: number[];
+};
+
+export type VideoFrameIndex = {
+  status: "idle" | "indexing" | "ready" | "approximate" | "failed";
+  frameCount: number;
+  frameRateNumerator: number;
+  frameRateDenominator: number;
+  variableFrameRate: boolean;
+  boundariesSeconds: number[] | null;
+  warning: string;
+};
+
+export type VideoTimelineState = {
+  startFrame: number;
+  endFrameExclusive: number;
+  playheadFrame: number;
+  viewStartFrame: number;
+  viewEndFrameExclusive: number;
 };
 
 export type ExportResult = {
@@ -124,6 +150,8 @@ export type QueueItem = {
   previewAssetPath: string;
   previewAssetTemporary: boolean;
   previewSeconds: number;
+  videoFrameIndex: VideoFrameIndex;
+  videoTimeline: VideoTimelineState;
   previewRevision: number;
   loadRevision: number;
   lastProbe: ProbeResult | null;
@@ -213,6 +241,22 @@ export function createQueueItem(mode: MediaMode, inputPath: string): QueueItem {
     previewAssetPath: "",
     previewAssetTemporary: false,
     previewSeconds: 0,
+    videoFrameIndex: {
+      status: "idle",
+      frameCount: 1,
+      frameRateNumerator: 30,
+      frameRateDenominator: 1,
+      variableFrameRate: false,
+      boundariesSeconds: null,
+      warning: "",
+    },
+    videoTimeline: {
+      startFrame: 0,
+      endFrameExclusive: 1,
+      playheadFrame: 0,
+      viewStartFrame: 0,
+      viewEndFrameExclusive: 1,
+    },
     previewRevision: 0,
     loadRevision: 0,
     lastProbe: null,

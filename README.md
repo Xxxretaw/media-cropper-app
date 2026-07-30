@@ -2,7 +2,7 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
-当前版本：`0.5.2`
+当前版本：`0.5.3`
 
 面向使用者的历次变化见 [`USER_FACING_CHANGELOG.md`](USER_FACING_CHANGELOG.md)；开发与安全层面的完整记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -69,7 +69,7 @@ npm run tauri -- build
 产物默认位于：
 
 - `src-tauri/target/release/bundle/macos/media-cropper.app`
-- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.2_aarch64.dmg`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.3_aarch64.dmg`
 
 当前发行包使用 ad-hoc 签名，不依赖 Apple Developer ID。首次从网络下载后，macOS 仍可能要求用户在“系统设置 → 隐私与安全性”中确认打开。
 
@@ -80,8 +80,8 @@ npm run tauri -- build
 发布新版本时同步更新版本号和更新记录，然后创建并推送版本标签：
 
 ```bash
-git tag v0.5.2
-git push origin v0.5.2
+git tag v0.5.3
+git push origin v0.5.3
 ```
 
 GitHub Actions 会自动构建 Apple Silicon 的 DMG 和 Tauri 更新包，并将 `latest.json`、签名与产物发布到 GitHub Releases。已安装 `0.4.0` 或更高版本的用户会在下次启动时收到更新提示。

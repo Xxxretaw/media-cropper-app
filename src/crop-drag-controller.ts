@@ -2,6 +2,7 @@ import type { CropRect } from "./crop-geometry";
 import type { QueueItem } from "./media-model";
 
 type HandleMode = "move" | "nw" | "ne" | "sw" | "se";
+type ResizeHandleMode = Exclude<HandleMode, "move">;
 
 export type CropDragBindings = {
   cropBoxEl: HTMLElement | null;
@@ -16,6 +17,57 @@ export type CropDragBindings = {
   syncScaleFromRect: () => void;
   drawCropBox: () => void;
 };
+
+export function resizeFixedRatioRectFromCorner(
+  startRect: CropRect,
+  bounds: CropRect,
+  mode: ResizeHandleMode,
+  dx: number,
+  dy: number,
+  ratio: number,
+): CropRect {
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    return { ...startRect };
+  }
+
+  const dragRight = mode === "ne" || mode === "se";
+  const dragBottom = mode === "sw" || mode === "se";
+  const oppositeX = dragRight ? startRect.x : startRect.x + startRect.width;
+  const oppositeY = dragBottom ? startRect.y : startRect.y + startRect.height;
+  const pointerWidth = Math.max(
+    0,
+    startRect.width + (dragRight ? dx : -dx),
+  );
+  const pointerHeight = Math.max(
+    0,
+    startRect.height + (dragBottom ? dy : -dy),
+  );
+
+  // Project the pointer displacement onto the fixed-ratio diagonal so both
+  // horizontal and vertical dragging contribute naturally to the resize.
+  const projectedHeight =
+    (pointerWidth * ratio + pointerHeight) / (ratio * ratio + 1);
+  const maxWidth = dragRight
+    ? bounds.x + bounds.width - oppositeX
+    : oppositeX - bounds.x;
+  const maxHeight = dragBottom
+    ? bounds.y + bounds.height - oppositeY
+    : oppositeY - bounds.y;
+  const maxRatioHeight = Math.max(0, Math.min(maxWidth / ratio, maxHeight));
+  const minimumRatioHeight = Math.min(maxRatioHeight, 20 / ratio);
+  const height = Math.max(
+    minimumRatioHeight,
+    Math.min(maxRatioHeight, projectedHeight),
+  );
+  const width = height * ratio;
+
+  return {
+    x: dragRight ? oppositeX : oppositeX - width,
+    y: dragBottom ? oppositeY : oppositeY - height,
+    width,
+    height,
+  };
+}
 
 export function bindCropDragging(bindings: CropDragBindings) {
   let mode: HandleMode | null = null;
@@ -100,57 +152,14 @@ export function bindCropDragging(bindings: CropDragBindings) {
       };
       bindings.syncScaleFromRect();
     } else {
-      let nextWidth = startRect.width;
-      let nextX = startRect.x;
-      let nextY = startRect.y;
-
-      if (mode === "se" || mode === "ne") {
-        nextWidth = startRect.width + dx;
-      } else if (mode === "sw" || mode === "nw") {
-        nextWidth = startRect.width - dx;
-      }
-
-      nextWidth = Math.max(20, nextWidth);
-      let nextHeight = nextWidth / ratio;
-
-      if (mode === "se") {
-        nextX = startRect.x;
-        nextY = startRect.y;
-      } else if (mode === "ne") {
-        nextX = startRect.x;
-        nextY = startRect.y + startRect.height - nextHeight;
-      } else if (mode === "sw") {
-        nextX = startRect.x + startRect.width - nextWidth;
-        nextY = startRect.y;
-      } else if (mode === "nw") {
-        nextX = startRect.x + startRect.width - nextWidth;
-        nextY = startRect.y + startRect.height - nextHeight;
-      }
-
-      if (nextX < bounds.x) {
-        const overflow = bounds.x - nextX;
-        nextWidth -= overflow;
-        nextHeight = nextWidth / ratio;
-        nextX = bounds.x;
-      }
-      if (nextY < bounds.y) {
-        nextY = bounds.y;
-      }
-      if (nextX + nextWidth > boundsRight) {
-        nextWidth = boundsRight - nextX;
-        nextHeight = nextWidth / ratio;
-      }
-      if (nextY + nextHeight > boundsBottom) {
-        nextHeight = boundsBottom - nextY;
-        nextWidth = nextHeight * ratio;
-      }
-
-      item.settings.rect = {
-        x: nextX,
-        y: nextY,
-        width: nextWidth,
-        height: nextWidth / ratio,
-      };
+      item.settings.rect = resizeFixedRatioRectFromCorner(
+        startRect,
+        bounds,
+        mode,
+        dx,
+        dy,
+        ratio,
+      );
       bindings.clampRect();
       bindings.syncScaleFromRect();
     }

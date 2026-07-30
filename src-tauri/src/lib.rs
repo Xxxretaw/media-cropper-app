@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -18,6 +18,7 @@ static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PREVIEW_PROXY_BIT_RATE: u64 = 1_200_000;
 const MAX_PREVIEW_PROXY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREVIEW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_VIDEO_FRAME_INDEX_FRAMES: usize = 2_000_000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -873,17 +874,11 @@ fn probe_media(
     probe_media_inner(input_path, Some(&manager), task_id.as_deref())
 }
 
-fn normalize_frame_boundaries(raw: &Value, duration_seconds: Option<f64>) -> Vec<f64> {
-    let frames = raw["frames"].as_array().cloned().unwrap_or_default();
-    let last_frame_duration = frames
-        .last()
-        .and_then(|frame| parse_optional_f64(frame.get("pkt_duration_time")))
-        .filter(|value| value.is_finite() && *value > 0.0);
-    let mut starts = frames
-        .iter()
-        .filter_map(|frame| parse_optional_f64(frame.get("best_effort_timestamp_time")))
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
+fn normalize_frame_boundaries(
+    mut starts: Vec<f64>,
+    last_frame_duration: Option<f64>,
+    duration_seconds: Option<f64>,
+) -> Vec<f64> {
     if starts.is_empty() {
         return Vec::new();
     }
@@ -919,6 +914,26 @@ fn normalize_frame_boundaries(raw: &Value, duration_seconds: Option<f64>) -> Vec
     boundaries
 }
 
+fn parse_frame_timing_csv_line(line: &str) -> Option<(f64, Option<f64>)> {
+    let mut fields = line.trim().split(',');
+    let first = fields.next()?.trim_matches('"');
+    let timestamp_field = if first == "frame" {
+        fields.next()?.trim_matches('"')
+    } else {
+        first
+    };
+    let timestamp = timestamp_field.parse::<f64>().ok()?;
+    if !timestamp.is_finite() {
+        return None;
+    }
+    let duration = fields
+        .next()
+        .map(|value| value.trim_matches('"'))
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    Some((timestamp, duration))
+}
+
 fn build_video_frame_index_inner(
     input_path: String,
     duration_seconds: Option<f64>,
@@ -929,8 +944,8 @@ fn build_video_frame_index_inner(
     if !input.is_file() {
         return Err("输入媒体不存在或不是普通文件".to_string());
     }
-    let output = run_command_output(
-        Command::new(find_ffprobe()).args([
+    let mut child = Command::new(find_ffprobe())
+        .args([
             "-v",
             "error",
             "-select_streams",
@@ -938,20 +953,96 @@ fn build_video_frame_index_inner(
             "-show_frames",
             "-show_entries",
             "frame=best_effort_timestamp_time,pkt_duration_time",
-            "-print_format",
-            "json",
+            "-of",
+            "csv=p=0",
             &input_path,
-        ]),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("ffprobe 帧索引启动失败: {error}"))?;
+    let pid = child.id();
+    if let (Some(manager), Some(task_id)) = (manager, task_id) {
+        manager.register(task_id, pid);
+    }
+    let registration = RegisteredProcess {
         manager,
         task_id,
-    )
-    .map_err(|error| format!("ffprobe 帧索引启动失败: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        pid,
+    };
+    let stdout = child.stdout.take().ok_or_else(|| {
+        terminate_process(pid);
+        "无法读取 ffprobe 帧索引输出".to_string()
+    })?;
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr.read_to_end(&mut bytes);
+            (bytes, result)
+        })
+    });
+
+    let mut starts = Vec::new();
+    let mut last_frame_duration = None;
+    let mut read_error = None;
+    let mut limit_reached = false;
+    for line in BufReader::new(stdout).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        };
+        let Some((timestamp, duration)) = parse_frame_timing_csv_line(&line) else {
+            continue;
+        };
+        if starts.len() >= MAX_VIDEO_FRAME_INDEX_FRAMES {
+            limit_reached = true;
+            break;
+        }
+        starts.push(timestamp);
+        if duration.is_some() {
+            last_frame_duration = duration;
+        }
     }
-    let raw: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("ffprobe 帧索引解析失败: {error}"))?;
-    let boundaries_seconds = normalize_frame_boundaries(&raw, duration_seconds);
+    if read_error.is_some() || limit_reached {
+        terminate_process(pid);
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("等待 ffprobe 帧索引结束失败: {error}"))?;
+    drop(registration);
+    let (stderr, stderr_read_error) = match stderr_reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "读取 ffprobe 错误输出的线程异常退出".to_string())?,
+        None => (Vec::new(), Ok(0)),
+    };
+    if let Some(error) = read_error {
+        return Err(format!("读取 ffprobe 帧索引输出失败: {error}"));
+    }
+    if let Err(error) = stderr_read_error {
+        return Err(format!("读取 ffprobe 错误输出失败: {error}"));
+    }
+    if limit_reached {
+        return Err(format!(
+            "视频超过逐帧索引上限（{} 帧），当前仅能近似到帧",
+            MAX_VIDEO_FRAME_INDEX_FRAMES
+        ));
+    }
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "ffprobe 帧索引生成失败".to_string()
+        } else {
+            message
+        });
+    }
+
+    let boundaries_seconds =
+        normalize_frame_boundaries(starts, last_frame_duration, duration_seconds);
     if boundaries_seconds.len() < 2 {
         return Err("没有读取到有效的视频帧时间戳".to_string());
     }
@@ -2027,9 +2118,9 @@ mod tests {
         detection_confidence, export_media_inner, find_ffmpeg, generate_preview_video_asset,
         inset_detected_margins, is_direct_preview_compatible, is_managed_preview_asset,
         normalize_frame_boundaries, parse_bbox_metadata, parse_frame_rate, parse_frame_rate_ratio,
-        parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
-        representative_rect_for_window, suffixed_output_path, BorderMargins, CropRect,
-        CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
+        parse_frame_timing_csv_line, parse_rotation_degrees, probe_media_inner,
+        probe_result_from_raw, representative_rect_for_window, suffixed_output_path, BorderMargins,
+        CropRect, CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
     };
     use serde_json::json;
     use std::env;
@@ -2246,19 +2337,25 @@ mod tests {
 
     #[test]
     fn frame_boundaries_are_normalized_and_get_an_exclusive_end() {
-        let raw = json!({
-            "frames": [
-                { "best_effort_timestamp_time": "5.000" },
-                { "best_effort_timestamp_time": "5.033" },
-                { "best_effort_timestamp_time": "5.067" },
-                { "best_effort_timestamp_time": "5.067" }
-            ]
-        });
-        let boundaries = normalize_frame_boundaries(&raw, Some(0.1));
+        let boundaries =
+            normalize_frame_boundaries(vec![5.0, 5.033, 5.067, 5.067], None, Some(0.1));
         assert_eq!(boundaries.len(), 4);
         assert_eq!(boundaries[0], 0.0);
         assert!((boundaries[1] - 0.033).abs() < 0.000_001);
         assert!(boundaries[3] >= 0.1);
+    }
+
+    #[test]
+    fn frame_timing_csv_parser_handles_plain_and_prefixed_rows() {
+        assert_eq!(
+            parse_frame_timing_csv_line("5.033000,0.033000"),
+            Some((5.033, Some(0.033)))
+        );
+        assert_eq!(
+            parse_frame_timing_csv_line("frame,5.067000,N/A"),
+            Some((5.067, None))
+        );
+        assert_eq!(parse_frame_timing_csv_line("N/A,0.033000"), None);
     }
 
     #[test]

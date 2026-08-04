@@ -2,7 +2,7 @@
 
 基于 Tauri 2、Vanilla TypeScript、Rust 和本地 FFmpeg 的桌面图片/视频裁切工具。素材在本机处理，不上传服务器。
 
-当前版本：`0.5.3`
+当前版本：`0.5.4`
 
 面向使用者的历次变化见 [`USER_FACING_CHANGELOG.md`](USER_FACING_CHANGELOG.md)；开发与安全层面的完整记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -52,7 +52,7 @@ npm test
 
 ## 黑边检测说明
 
-黑边检测默认按需执行。批量导入后，可逐个选择不需要处理的视频并勾选“当前视频不参与批量检测”，再使用“检测全部”处理其余视频；该选项不影响“检测当前”。检测会在所选输出片段的多个时间点采样，并综合 FFmpeg `bbox` 亮度边界结果。只有多数采样结果稳定一致时才会自动更新裁切框；检测到画幅变化时会保留当前裁切区域并标记“需确认”。检测成功后，裁切边界会继续向有效画面内收 2–4 像素，避免残留黑边；该区域也会成为后续比例、锚点、缩放和手动拖拽的有效边界。若要回到完整画面裁切，可使用“撤销检测结果”恢复检测前的裁切状态，之后也可重新应用缓存结果。修改视频输出时间范围后，需要重新检测。
+黑边检测默认按需执行。批量导入后，可逐个选择不需要处理的视频并勾选“当前视频不参与批量检测”，再使用“检测全部”处理其余视频；该选项不影响“检测当前”。检测会在所选输出片段的多个时间点采样，并综合 FFmpeg `bbox` 亮度边界结果。只有多数采样结果稳定一致时才会自动更新裁切框；检测到画幅变化时会保留当前裁切区域并标记“需确认”。检测成功后，采用各采样边界的中位数，并继续向有效画面内收 3–5 像素，避免残留黑边；很窄的边缘也不会轻易直接判定为无黑边。该区域会成为后续比例、锚点、缩放和手动拖拽的有效边界。若要回到完整画面裁切，可使用“撤销检测结果”恢复检测前的裁切状态，之后也可重新应用缓存结果。修改视频输出时间范围后，需要重新检测。
 
 当前仓库只包含 Apple Silicon macOS 使用的 FFmpeg/FFprobe sidecar。构建其他平台版本前，需要补充对应目标架构的二进制文件。
 
@@ -69,7 +69,7 @@ npm run tauri -- build
 产物默认位于：
 
 - `src-tauri/target/release/bundle/macos/media-cropper.app`
-- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.3_aarch64.dmg`
+- `src-tauri/target/release/bundle/dmg/media-cropper_0.5.4_aarch64.dmg`
 
 当前发行包使用 ad-hoc 签名，不依赖 Apple Developer ID。首次从网络下载后，macOS 仍可能要求用户在“系统设置 → 隐私与安全性”中确认打开。
 
@@ -80,8 +80,8 @@ npm run tauri -- build
 发布新版本时同步更新版本号和更新记录，然后创建并推送版本标签：
 
 ```bash
-git tag v0.5.3
-git push origin v0.5.3
+git tag v0.5.4
+git push origin v0.5.4
 ```
 
 GitHub Actions 会自动构建 Apple Silicon 的 DMG 和 Tauri 更新包，并将 `latest.json`、签名与产物发布到 GitHub Releases。已安装 `0.4.0` 或更高版本的用户会在下次启动时收到更新提示。

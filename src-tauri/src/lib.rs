@@ -19,6 +19,11 @@ const PREVIEW_PROXY_BIT_RATE: u64 = 1_200_000;
 const MAX_PREVIEW_PROXY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREVIEW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_VIDEO_FRAME_INDEX_FRAMES: usize = 2_000_000;
+const BLACK_BORDER_MIN_LUMA: u8 = 28;
+const BLACK_BORDER_NO_BORDER_RATIO: f64 = 0.0025;
+const BLACK_BORDER_INSET_RATIO: f64 = 0.0025;
+const BLACK_BORDER_INSET_MIN: u64 = 3;
+const BLACK_BORDER_INSET_MAX: u64 = 5;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1354,6 +1359,17 @@ fn border_tolerances(source_width: u64, source_height: u64) -> BorderMargins {
     }
 }
 
+fn near_full_frame_tolerances(source_width: u64, source_height: u64) -> BorderMargins {
+    let horizontal = ((source_width as f64 * BLACK_BORDER_NO_BORDER_RATIO).round() as u64).max(2);
+    let vertical = ((source_height as f64 * BLACK_BORDER_NO_BORDER_RATIO).round() as u64).max(2);
+    BorderMargins {
+        left: horizontal,
+        top: vertical,
+        right: horizontal,
+        bottom: vertical,
+    }
+}
+
 fn margins_agree(first: BorderMargins, second: BorderMargins, tolerance: BorderMargins) -> bool {
     first.left.abs_diff(second.left) <= tolerance.left
         && first.top.abs_diff(second.top) <= tolerance.top
@@ -1399,17 +1415,39 @@ fn largest_margin_cluster(samples: &[BorderMargins], tolerance: BorderMargins) -
     largest
 }
 
-fn minimum_margin(samples: &[BorderMargins], cluster: &[usize]) -> Option<BorderMargins> {
-    let first = *cluster.first()?;
-    let mut result = samples[first];
-    for index in cluster.iter().copied().skip(1) {
-        let sample = samples[index];
-        result.left = result.left.min(sample.left);
-        result.top = result.top.min(sample.top);
-        result.right = result.right.min(sample.right);
-        result.bottom = result.bottom.min(sample.bottom);
+fn median_margin(samples: &[BorderMargins], cluster: &[usize]) -> Option<BorderMargins> {
+    if cluster.is_empty() {
+        return None;
     }
-    Some(result)
+
+    let mut left = cluster
+        .iter()
+        .map(|index| samples[*index].left)
+        .collect::<Vec<_>>();
+    let mut top = cluster
+        .iter()
+        .map(|index| samples[*index].top)
+        .collect::<Vec<_>>();
+    let mut right = cluster
+        .iter()
+        .map(|index| samples[*index].right)
+        .collect::<Vec<_>>();
+    let mut bottom = cluster
+        .iter()
+        .map(|index| samples[*index].bottom)
+        .collect::<Vec<_>>();
+    left.sort_unstable();
+    top.sort_unstable();
+    right.sort_unstable();
+    bottom.sort_unstable();
+    let middle = cluster.len() / 2;
+
+    Some(BorderMargins {
+        left: left[middle],
+        top: top[middle],
+        right: right[middle],
+        bottom: bottom[middle],
+    })
 }
 
 fn inset_detected_margins(
@@ -1417,8 +1455,10 @@ fn inset_detected_margins(
     source_width: u64,
     source_height: u64,
 ) -> BorderMargins {
-    let horizontal_inset = ((source_width as f64 * 0.002).round() as u64).clamp(2, 4);
-    let vertical_inset = ((source_height as f64 * 0.002).round() as u64).clamp(2, 4);
+    let horizontal_inset = ((source_width as f64 * BLACK_BORDER_INSET_RATIO).round() as u64)
+        .clamp(BLACK_BORDER_INSET_MIN, BLACK_BORDER_INSET_MAX);
+    let vertical_inset = ((source_height as f64 * BLACK_BORDER_INSET_RATIO).round() as u64)
+        .clamp(BLACK_BORDER_INSET_MIN, BLACK_BORDER_INSET_MAX);
     BorderMargins {
         left: margins.left.saturating_add(horizontal_inset),
         top: margins.top.saturating_add(vertical_inset),
@@ -1568,7 +1608,9 @@ fn run_bbox_window(
             "-sn",
             "-dn",
             "-vf",
-            "fps=8,format=yuv420p,bbox=min_val=24,metadata=mode=print:file=-",
+            &format!(
+                "fps=8,format=yuv420p,bbox=min_val={BLACK_BORDER_MIN_LUMA},metadata=mode=print:file=-"
+            ),
             "-f",
             "null",
             "-",
@@ -1732,11 +1774,12 @@ fn detect_black_borders_inner(
     }
 
     let consensus =
-        minimum_margin(&samples, &cluster).ok_or_else(|| "无法汇总黑边检测结果".to_string())?;
-    let near_full_frame = consensus.left <= tolerance.left
-        && consensus.top <= tolerance.top
-        && consensus.right <= tolerance.right
-        && consensus.bottom <= tolerance.bottom;
+        median_margin(&samples, &cluster).ok_or_else(|| "无法汇总黑边检测结果".to_string())?;
+    let no_border_tolerance = near_full_frame_tolerances(source_width, source_height);
+    let near_full_frame = consensus.left <= no_border_tolerance.left
+        && consensus.top <= no_border_tolerance.top
+        && consensus.right <= no_border_tolerance.right
+        && consensus.bottom <= no_border_tolerance.bottom;
 
     if near_full_frame {
         return Ok(DetectBlackBordersResult {
@@ -2117,10 +2160,11 @@ mod tests {
         build_preview_data_url_inner, build_video_frame_index_inner, detect_black_borders_inner,
         detection_confidence, export_media_inner, find_ffmpeg, generate_preview_video_asset,
         inset_detected_margins, is_direct_preview_compatible, is_managed_preview_asset,
-        normalize_frame_boundaries, parse_bbox_metadata, parse_frame_rate, parse_frame_rate_ratio,
-        parse_frame_timing_csv_line, parse_rotation_degrees, probe_media_inner,
-        probe_result_from_raw, representative_rect_for_window, suffixed_output_path, BorderMargins,
-        CropRect, CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
+        median_margin, near_full_frame_tolerances, normalize_frame_boundaries, parse_bbox_metadata,
+        parse_frame_rate, parse_frame_rate_ratio, parse_frame_timing_csv_line,
+        parse_rotation_degrees, probe_media_inner, probe_result_from_raw,
+        representative_rect_for_window, suffixed_output_path, BorderMargins, CropRect,
+        CropRectRequest, DetectBlackBordersRequest, ExportMediaRequest, ProbeResult,
     };
     use serde_json::json;
     use std::env;
@@ -2458,7 +2502,66 @@ lavfi.bbox.h=164
     }
 
     #[test]
-    fn detected_margins_crop_two_to_four_pixels_inside_content() {
+    fn median_margin_uses_the_middle_consensus_instead_of_the_smallest_margin() {
+        let samples = vec![
+            BorderMargins {
+                left: 100,
+                top: 200,
+                right: 300,
+                bottom: 400,
+            },
+            BorderMargins {
+                left: 102,
+                top: 202,
+                right: 302,
+                bottom: 402,
+            },
+            BorderMargins {
+                left: 105,
+                top: 205,
+                right: 305,
+                bottom: 405,
+            },
+            BorderMargins {
+                left: 108,
+                top: 208,
+                right: 308,
+                bottom: 408,
+            },
+            BorderMargins {
+                left: 110,
+                top: 210,
+                right: 310,
+                bottom: 410,
+            },
+        ];
+
+        assert_eq!(
+            median_margin(&samples, &[0, 1, 2, 3, 4]),
+            Some(BorderMargins {
+                left: 105,
+                top: 205,
+                right: 305,
+                bottom: 405,
+            })
+        );
+    }
+
+    #[test]
+    fn small_black_borders_are_not_treated_as_full_frame_too_easily() {
+        assert_eq!(
+            near_full_frame_tolerances(1920, 1080),
+            BorderMargins {
+                left: 5,
+                top: 3,
+                right: 5,
+                bottom: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn detected_margins_crop_three_to_five_pixels_inside_content() {
         let margins = BorderMargins {
             left: 100,
             top: 100,
@@ -2469,28 +2572,28 @@ lavfi.bbox.h=164
         assert_eq!(
             inset_detected_margins(margins, 640, 360),
             BorderMargins {
-                left: 102,
-                top: 102,
-                right: 102,
-                bottom: 102,
+                left: 103,
+                top: 103,
+                right: 103,
+                bottom: 103,
             }
         );
         assert_eq!(
             inset_detected_margins(margins, 1920, 1080),
             BorderMargins {
-                left: 104,
-                top: 102,
-                right: 104,
-                bottom: 102,
+                left: 105,
+                top: 103,
+                right: 105,
+                bottom: 103,
             }
         );
         assert_eq!(
             inset_detected_margins(margins, 3840, 2160),
             BorderMargins {
-                left: 104,
-                top: 104,
-                right: 104,
-                bottom: 104,
+                left: 105,
+                top: 105,
+                right: 105,
+                bottom: 105,
             }
         );
     }
@@ -2642,10 +2745,10 @@ lavfi.bbox.h=164
         assert_eq!(detection.sample_count, 7);
         assert!(detection.agreeing_samples >= 5);
         assert!(detection.confidence >= 0.7);
-        assert!((34..=42).contains(&detection.margins.left));
-        assert!((34..=42).contains(&detection.margins.top));
-        assert!((34..=42).contains(&detection.margins.right));
-        assert!((34..=42).contains(&detection.margins.bottom));
+        assert!((34..=46).contains(&detection.margins.left));
+        assert!((34..=46).contains(&detection.margins.top));
+        assert!((34..=46).contains(&detection.margins.right));
+        assert!((34..=46).contains(&detection.margins.bottom));
 
         let export = export_media_inner(
             ExportMediaRequest {
